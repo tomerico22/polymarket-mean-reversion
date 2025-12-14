@@ -18,6 +18,37 @@ from collections import defaultdict
 from psycopg import connect
 from psycopg.rows import dict_row
 
+def get_exclude_keywords():
+    """
+    Load keyword blacklist for mean reversion.
+
+    Priority:
+    1) mr/config/keyword_blacklist.txt  - one keyword per line
+    2) MR_EXCLUDE_KEYWORDS env var      - comma separated, fallback
+    """
+    terms = []
+
+    # file path: mr/config/keyword_blacklist.txt (relative to this file)
+    base_dir = os.path.dirname(__file__)
+    file_path = os.path.join(base_dir, "config", "keyword_blacklist.txt")
+
+    try:
+        with open(file_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    terms.append(line.lower())
+    except FileNotFoundError:
+        pass
+
+    # fallback to env if file missing or empty
+    if not terms:
+        raw = os.getenv("MR_EXCLUDE_KEYWORDS", "")
+        if raw:
+            terms = [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+    return terms
+
 DB_URL = os.getenv("DB_URL")
 if not DB_URL:
     raise SystemExit("DB_URL not set")
@@ -83,7 +114,9 @@ LOOP_SLEEP = int(os.getenv("MR_LOOP_SLEEP", "10"))
 _tags_env = os.getenv("MR_EXCLUDED_TAGS") or os.getenv("MR_EXCLUDE_TAGS") or "sports,nfl,nba,soccer,mlb,hockey"
 EXCLUDED_TAGS = set([t.strip().lower() for t in _tags_env.split(",") if t.strip()])
 EXCLUDED_CATEGORIES = set()  # categories not present in polymarket schema; tags only
-EXCLUDED_KEYWORDS = set([k.strip().lower() for k in os.getenv("MR_EXCLUDE_KEYWORDS", "").split(",") if k.strip()])
+
+# Load keyword blacklist once (file first, then env fallback)
+EXCLUDED_KEYWORDS = set(get_exclude_keywords())
 
 # Require markets to have a question/title
 REQUIRE_QUESTION = os.getenv("MR_REQUIRE_QUESTION", "0") == "1"
@@ -317,6 +350,7 @@ def is_market_valid(cur, market_id):
     if REQUIRE_QUESTION and len(question) < 10:
         return False, "no_question"
 
+    # keyword blacklist: use cached EXCLUDED_KEYWORDS
     if question and EXCLUDED_KEYWORDS:
         qlow = question.lower()
         for kw in EXCLUDED_KEYWORDS:
@@ -963,7 +997,7 @@ def main():
           f"sl={float(STOP_LOSS_PCT)*100:.0f}%, hold={MAX_HOLD_HOURS}h, window={AVG_WINDOW_HOURS}h")
     print(f"{LOG_PREFIX} Markets: top {TOP_MARKETS}, min vol ${float(MIN_VOLUME_24H):.0f}")
     print(f"{LOG_PREFIX} Excluded: tags={EXCLUDED_TAGS}, categories={EXCLUDED_CATEGORIES}")
-    print(f"{LOG_PREFIX} Excluded keywords: {EXCLUDED_KEYWORDS}")
+    print(f"{LOG_PREFIX} Excluded keywords: {', '.join(EXCLUDED_KEYWORDS)}")
     print(f"{LOG_PREFIX} Require question: {REQUIRE_QUESTION}")
     print(f"{LOG_PREFIX} Limits: max {MAX_OPEN_POSITIONS} positions, ${float(DAILY_LOSS_LIMIT):.0f} daily loss limit")
     

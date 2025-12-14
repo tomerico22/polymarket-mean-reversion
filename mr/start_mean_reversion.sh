@@ -75,4 +75,4 @@ python3 -c "import psycopg" 2>/dev/null || {
 }
 
 # Run the executor
-python3 mean_reversion_executor.py
+python3 mr/mean_reversion_executor.py

@@ -1,0 +1,25 @@
+# secrets
+.env
+*.env
+*.key
+*.pem
+
+# venv / python cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# logs / runtime
+logs/
+*.log
+
+# local config (keep only templates if needed)
+config/
+mr/config/
+*.local
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

@@ -6,8 +6,8 @@ from datetime import datetime, timezone, timedelta
 from psycopg import connect
 from psycopg.rows import tuple_row
 
-from ingestors import live_trades_ws as trades_ws
-from ingestors.fetch_markets import ensure_market_exists
+from . import live_trades_ws as trades_ws
+from pipeline.ingestors.fetch_markets import ensure_market_exists
 
 
 DB_URL = os.getenv("DB_URL")

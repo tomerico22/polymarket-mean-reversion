@@ -23,3 +23,6 @@ mr/config/
 .DS_Store
 .vscode/
 .idea/
+
+# local backups
+*.bak*

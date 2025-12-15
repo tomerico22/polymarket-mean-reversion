@@ -1,1054 +1,878 @@
-"""
-Mean Reversion Trading Executor - Longs Only (Paper Trading)
-
-Validated settings from backtest:
-- 85.4% win rate
-- +9.40% avg P&L per trade
-- 18h rolling average window
-- Excludes sports markets
-- Longs only (shorts were unprofitable)
-"""
-
 import os
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from collections import defaultdict
 
 from psycopg import connect
 from psycopg.rows import dict_row
 
-def get_exclude_keywords():
-    """
-    Load keyword blacklist for mean reversion.
+"""
+Mean Reversion Executor (Paper)
+- Longs only
+- Peak-to-trough market drawdown (realized + unrealized, mark-to-market)
+- Stale prices -> cooldown ban
+- Drawdown -> permanent ban + forced liquidation
+- Batch price snapshot (single query per loop)
+- Entry dedup + position limits + time-based exits
+- Entry COUNT caching to reduce DB load
+"""
 
-    Priority:
-    1) mr/config/keyword_blacklist.txt  - one keyword per line
-    2) MR_EXCLUDE_KEYWORDS env var      - comma separated, fallback
-    """
-    terms = []
-
-    # file path: mr/config/keyword_blacklist.txt (relative to this file)
-    base_dir = os.path.dirname(__file__)
-    file_path = os.path.join(base_dir, "config", "keyword_blacklist.txt")
-
-    try:
-        with open(file_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    terms.append(line.lower())
-    except FileNotFoundError:
-        pass
-
-    # fallback to env if file missing or empty
-    if not terms:
-        raw = os.getenv("MR_EXCLUDE_KEYWORDS", "")
-        if raw:
-            terms = [x.strip().lower() for x in raw.split(",") if x.strip()]
-
-    return terms
+# =========================
+# CONFIG
+# =========================
 
 DB_URL = os.getenv("DB_URL")
 if not DB_URL:
     raise SystemExit("DB_URL not set")
 
-# Strategy identifiers
-STRATEGY_MEAN_REV_V1 = "mean_reversion_v1"
-STRATEGY_MEAN_REV_STRICT_V1 = "mean_reversion_strict_v1"
-STRATEGY_MEAN_REV_V2 = "mean_reversion_v2"
-
-# Strategy name (selected via env)
-STRATEGY = os.getenv("MR_STRATEGY", STRATEGY_MEAN_REV_V1)
-# Log prefix: use [MRS] for strict variants, else [MR]
-LOG_PREFIX = "[MRS]" if "strict" in STRATEGY else "[MR]"
-
-# Entry filters (validated from backtest)
-DISLOCATION_THRESHOLD = Decimal(os.getenv("MR_DISLOCATION_THRESHOLD", "0.20"))
-MAX_DISLOCATION = Decimal(os.getenv("MR_MAX_DISLOCATION", "0.45"))
-MIN_PRICE = Decimal(os.getenv("MR_MIN_PRICE", "0.05"))
-MAX_PRICE = Decimal(os.getenv("MR_MAX_PRICE", "0.95"))
-AVG_WINDOW_HOURS = int(os.getenv("MR_AVG_WINDOW_HOURS", "18"))
-
-# Exit parameters (validated from backtest)
-TAKE_PROFIT_PCT = Decimal(os.getenv("MR_TAKE_PROFIT_PCT", "0.15"))
-STOP_LOSS_PCT = Decimal(os.getenv("MR_STOP_LOSS_PCT", "0.15"))
-MAX_HOLD_HOURS = int(os.getenv("MR_MAX_HOLD_HOURS", "12"))
-# Hard maximum stop loss as a safety net (realized P&L based)
-MAX_STOP_LOSS_PCT = Decimal(os.getenv("MR_MAX_STOP_LOSS_PCT", "0.20"))
-# Optional positive tag whitelist
-_inc_tags_env = os.getenv("MR_INCLUDED_TAGS", "")
-INCLUDED_TAGS = set([t.strip().lower() for t in _inc_tags_env.split(",") if t.strip()])
-# Per-market PnL kill switch
-MARKET_MAX_DRAWDOWN_USD = Decimal(os.getenv("MR_MARKET_MAX_DRAWDOWN_USD", "0"))
-# Per market consecutive loss streak limit
-MAX_LOSS_STREAK = int(os.getenv("MR_MAX_LOSS_STREAK", "4"))
-# Track consecutive losses per market and outcome
-MARKET_LOSS_STREAK = defaultdict(int)  # key: (strategy, market_id, outcome)
-# --- MR V2 specific filters ---
-MR2_MAX_ENTRY_PX = Decimal(os.getenv("MR2_MAX_ENTRY_PX", "0.15"))
-MR2_MIN_DISLOCATION = Decimal(os.getenv("MR2_MIN_DISLOCATION", "-0.45"))
-MR2_MARKET_MAX_LOSS_USD = Decimal(os.getenv("MR2_MARKET_MAX_LOSS_USD", "75"))
-MR2_EXCLUDED_TAGS_SET = {t.strip() for t in (os.getenv("MR2_EXCLUDED_TAGS", "")).split(",") if t.strip()}
-# market_id -> cumulative realized pnl for v2
-MARKET_REALIZED_PNL_V2 = defaultdict(lambda: Decimal("0"))
+STRATEGY = os.getenv("MR_STRATEGY", "mean_reversion_v1")
+LOG_PREFIX = "[MRS]"
 
 # Position sizing
 BASE_POSITION_USD = Decimal(os.getenv("MR_BASE_POSITION_USD", "100"))
-MAX_POSITION_USD = Decimal(os.getenv("MR_MAX_POSITION_USD", "200"))
 
-# Risk management
+# Risk - market drawdown (peak-to-trough)
+MR_MARKET_DD_FRACTION = Decimal(os.getenv("MR_MARKET_DD_FRACTION", "0.75"))  # fraction of BASE_POSITION_USD
+SLIPPAGE = Decimal(os.getenv("MR_SLIPPAGE", "0.01"))
+
+# Price bounds
+MIN_PRICE = Decimal(os.getenv("MR_MIN_PRICE", "0"))
+MAX_PRICE = Decimal(os.getenv("MR_MAX_PRICE", "1"))
+
+# ----------------------------
+# Keyword blacklist (question-based)
+# ----------------------------
+KEYWORD_BLACKLIST_PATH = Path(os.getenv(
+    "MR_KEYWORD_BLACKLIST_PATH",
+    "/root/polymarket-mean-reversion/mr/config/keyword_blacklist.txt"
+))
+REQUIRE_QUESTION = os.getenv("MR_REQUIRE_QUESTION", "0").strip() == "1"
+
+_kw_file_mtime = None
+_kw_file_list = []
+
+def _kw_norm(s: str) -> str:
+    return " ".join(str(s).lower().strip().split())
+
+def _load_keyword_blacklist():
+    global _kw_file_mtime, _kw_file_list
+
+    # env csv support (keeps MR_EXCLUDE_KEYWORDS behavior)
+    env_csv = os.getenv("MR_EXCLUDE_KEYWORDS", "") or ""
+    env_list = [_kw_norm(x) for x in env_csv.split(",") if _kw_norm(x)]
+
+    # file list (auto-reload on mtime change)
+    try:
+        st = KEYWORD_BLACKLIST_PATH.stat()
+        mtime = st.st_mtime
+        if _kw_file_mtime != mtime:
+            lines = KEYWORD_BLACKLIST_PATH.read_text().splitlines()
+            cleaned = []
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                cleaned.append(_kw_norm(line))
+            _kw_file_list = [x for x in cleaned if x]
+            _kw_file_mtime = mtime
+    except Exception:
+        _kw_file_list = []
+
+    return sorted(set([x for x in (_kw_file_list + env_list) if x]))
+
+def is_question_blocked(question: str) -> bool:
+    q = _kw_norm(question or "")
+    if REQUIRE_QUESTION and not q:
+        return True
+    for kw in _load_keyword_blacklist():
+        if kw and kw in q:
+            return True
+    return False
+
+def first_blocking_keyword(question: str) -> str:
+    q = _kw_norm(question or "")
+    if REQUIRE_QUESTION and not q:
+        return "__missing_question__"
+    for kw in _load_keyword_blacklist():
+        if kw and kw in q:
+            return kw
+    return ""
+
+# Strategy thresholds
+DISLOCATION_THRESHOLD = Decimal(os.getenv("MR_DISLOCATION_THRESHOLD", "0.20"))
+MAX_DISLOCATION = Decimal(os.getenv("MR_MAX_DISLOCATION", "0.45"))
+
+# Exits
+TAKE_PROFIT_PCT = Decimal(os.getenv("MR_TAKE_PROFIT_PCT", "0.15"))
+STOP_LOSS_PCT = Decimal(os.getenv("MR_STOP_LOSS_PCT", "0.15"))
+MAX_STOP_LOSS_PCT = Decimal(os.getenv("MR_MAX_STOP_LOSS_PCT", "0.20"))  # hard cap / worst-case fallback
+MAX_HOLD_HOURS = int(os.getenv("MR_MAX_HOLD_HOURS", "12"))
+
+# Limits
 MAX_OPEN_POSITIONS = int(os.getenv("MR_MAX_OPEN_POSITIONS", "10"))
 MAX_POSITIONS_PER_MARKET = int(os.getenv("MR_MAX_POSITIONS_PER_MARKET", "1"))
-MARKET_COOLDOWN_SECS = int(os.getenv("MR_MARKET_COOLDOWN_SECS", "600"))  # 10 min
 
 # Market selection
 TOP_MARKETS = int(os.getenv("MR_TOP_MARKETS", "50"))
 MIN_VOLUME_24H = Decimal(os.getenv("MR_MIN_VOLUME_24H", "10000"))
 
-# Execution
-SLIPPAGE = Decimal(os.getenv("MR_SLIPPAGE", "0.01"))
+# Excluded tags (optional, requires markets.tags column)
+_tags_env = os.getenv("MR_EXCLUDED_TAGS") or os.getenv("MR_EXCLUDE_TAGS") or "sports,nfl,nba,soccer,mlb,hockey"
+EXCLUDED_TAGS = {t.strip().lower() for t in _tags_env.split(",") if t.strip()}
+
+# Price staleness
+MR_PRICE_STALE_SECS = int(os.getenv("MR_PRICE_STALE_SECS", "300"))
+MR_STALE_BAN_SECS = int(os.getenv("MR_STALE_BAN_SECS", "900"))
+
+# Loop
 LOOP_SLEEP = int(os.getenv("MR_LOOP_SLEEP", "10"))
 
-# Market filters - CRITICAL: exclude sports and unwanted keywords
-_tags_env = os.getenv("MR_EXCLUDED_TAGS") or os.getenv("MR_EXCLUDE_TAGS") or "sports,nfl,nba,soccer,mlb,hockey"
-EXCLUDED_TAGS = set([t.strip().lower() for t in _tags_env.split(",") if t.strip()])
-EXCLUDED_CATEGORIES = set()  # categories not present in polymarket schema; tags only
-
-# Load keyword blacklist once (file first, then env fallback)
-EXCLUDED_KEYWORDS = set(get_exclude_keywords())
-
-# Require markets to have a question/title
-REQUIRE_QUESTION = os.getenv("MR_REQUIRE_QUESTION", "0") == "1"
-
-# Circuit breaker
-DAILY_LOSS_LIMIT = Decimal(os.getenv("MR_DAILY_LOSS_LIMIT", "1000"))
-
-# State tracking
-LAST_MARKET_CLOSE = defaultdict(lambda: datetime.min.replace(tzinfo=timezone.utc))
-DAILY_PNL_RESET = datetime.now(timezone.utc).date()
-DAILY_PNL = Decimal("0")
-
+# =========================
+# HELPERS
+# =========================
 
 def to_dec(val, default=None):
     try:
+        if val is None:
+            return default
         return Decimal(str(val))
     except (InvalidOperation, TypeError):
         return default
 
+def norm_market_id(market_id):
+    if market_id is None:
+        raise ValueError("market_id cannot be None")
+    mid = str(market_id).strip()
+    if not mid:
+        raise ValueError("market_id cannot be empty")
+    return mid
 
 def get_conn():
-    return connect(DB_URL, row_factory=dict_row)
+    conn = connect(DB_URL, row_factory=dict_row)
+    conn.autocommit = True
+    conn.prepare_threshold = None
+    return conn
 
+# =========================
+# TABLES
+# =========================
 
-def ensure_tables(conn):
-    """Create positions + shadow fills tables if not exists"""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mr_positions (
-                id              serial PRIMARY KEY,
-                strategy        text NOT NULL,
-                market_id       text NOT NULL,
-                outcome         text NOT NULL,
-                side            text NOT NULL,
-                entry_price     numeric NOT NULL,
-                entry_ts        timestamptz NOT NULL,
-                size            numeric NOT NULL,
-                avg_price_18h   numeric NOT NULL,
-                dislocation     numeric NOT NULL,
-                status          text DEFAULT 'open',
-                exit_price      numeric,
-                exit_ts         timestamptz,
-                exit_reason     text,
-                pnl             numeric,
-                market_class    text
-            );
-            """
-        )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_mr_positions_open 
-            ON mr_positions(strategy, status, market_id, outcome);
-            """
-        )
+def ensure_tables(cur):
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS mr_positions (
+        id SERIAL PRIMARY KEY,
+        strategy TEXT NOT NULL,
+        market_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        side TEXT NOT NULL,
+        entry_price NUMERIC NOT NULL,
+        entry_ts TIMESTAMPTZ NOT NULL,
+        size NUMERIC NOT NULL,
+        status TEXT DEFAULT 'open',
+        exit_price NUMERIC,
+        exit_ts TIMESTAMPTZ,
+        exit_reason TEXT,
+        pnl NUMERIC,
+        avg_price_18h NUMERIC,
+        dislocation NUMERIC
+    );
+    """)
 
-        # NEW: shadow fills table (execution simulation)
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mr_shadow_fills (
-                id              serial PRIMARY KEY,
-                strategy        text NOT NULL,
-                market_id       text NOT NULL,
-                outcome         text NOT NULL,
-                side            text NOT NULL,
-                ts              timestamptz NOT NULL,
-                size            numeric NOT NULL,
-                signal_price    numeric NOT NULL,
-                sim_entry_price numeric NOT NULL,
-                avg_price_18h   numeric NOT NULL,
-                dislocation     numeric NOT NULL,
-                notes           text
-            );
-            """
-        )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_mr_shadow_fills_main
-            ON mr_shadow_fills(strategy, market_id, outcome, ts);
-            """
-        )
-    conn.commit()
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_mr_positions_open
+    ON mr_positions(strategy, status, market_id, outcome);
+    """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS mr_market_risk_state (
+        strategy TEXT NOT NULL,
+        market_id TEXT NOT NULL,
+        peak_equity NUMERIC NOT NULL DEFAULT 0,
+        last_equity NUMERIC NOT NULL DEFAULT 0,
+        banned BOOLEAN NOT NULL DEFAULT FALSE,
+        banned_until TIMESTAMPTZ,
+        banned_reason TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (strategy, market_id)
+    );
+    """)
 
-def load_market_pnls_for_mr_v2(conn):
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_mr_market_risk_banned
+    ON mr_market_risk_state(strategy, banned, banned_until)
+    WHERE banned = true;
+    """)
+
+# =========================
+# PRICE SNAPSHOT CACHE
+# =========================
+
+PRICE_SNAPSHOT = {}  # (market_id, outcome) -> (price: Decimal, ts: datetime)
+
+def refresh_price_snapshot(cur, pairs):
     """
-    Preload cumulative PnL per market for mean_reversion_v2 from mr_positions.
+    Batch-load latest prices for (market_id, outcome) pairs into PRICE_SNAPSHOT.
+    Uses zipped UNNEST of two arrays -> one row per pair.
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT market_id, COALESCE(SUM(pnl), 0) AS pnl
-            FROM mr_positions
-            WHERE strategy = %s AND status = 'closed'
-            GROUP BY market_id
-            """,
-            (STRATEGY_MEAN_REV_V2,),
+    global PRICE_SNAPSHOT
+    PRICE_SNAPSHOT = {}
+
+    pairs = list({(norm_market_id(m), str(o).strip()) for m, o in pairs if m is not None and o is not None})
+    if not pairs:
+        return
+
+    market_ids = [m for m, _ in pairs]
+    outcomes = [o for _, o in pairs]
+
+    cur.execute("""
+        WITH pairs(market_id, outcome) AS (
+            SELECT * FROM UNNEST(%s::text[], %s::text[]) AS t(market_id, outcome)
         )
-        for market_id, pnl in cur.fetchall():
-            MARKET_REALIZED_PNL_V2[str(market_id)] = to_dec(pnl, Decimal("0"))
+        SELECT DISTINCT ON (rt.market_id, rt.outcome)
+            rt.market_id, rt.outcome, rt.price, rt.ts
+        FROM raw_trades rt
+        JOIN pairs p
+          ON rt.market_id = p.market_id
+         AND rt.outcome = p.outcome
+        ORDER BY rt.market_id, rt.outcome, rt.ts DESC
+    """, (market_ids, outcomes))
 
+    for r in (cur.fetchall() or []):
+        PRICE_SNAPSHOT[(norm_market_id(r["market_id"]), str(r["outcome"]).strip())] = (
+            Decimal(str(r["price"])),
+            r["ts"],
+        )
 
-def is_market_excluded(cur, market_id):
-    """Check if market should be excluded (sports, etc)"""
+def get_last_price_cached(market_id, outcome):
+    return PRICE_SNAPSHOT.get((norm_market_id(market_id), str(outcome).strip()))
+
+def is_price_stale(px_ts, now_ts):
+    return (now_ts - px_ts).total_seconds() > MR_PRICE_STALE_SECS
+
+def market_has_stale_price(market_id, now_ts):
+    """
+    Market-level stale check:
+    If any required outcome price is missing OR stale, treat market as stale.
+    """
+    mid = norm_market_id(market_id)
+    for outcome in ("0", "1"):
+        cached = get_last_price_cached(mid, outcome)
+        if not cached:
+            return True
+        _, ts = cached
+        if is_price_stale(ts, now_ts):
+            return True
+    return False
+
+# =========================
+# MARKET TAG FILTER (optional)
+# =========================
+
+def is_market_excluded_by_tags(cur, market_id):
+    """
+    If markets.tags exists, exclude if any overlap with EXCLUDED_TAGS.
+    If markets table or tags column doesn't exist, fail open (do not exclude).
+    """
     if not EXCLUDED_TAGS:
         return False
-    cur.execute(
-        """
-        SELECT tags
-        FROM markets
-        WHERE market_id = %s
-        LIMIT 1
-        """,
-        (market_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return False
-
-    tags_val = row.get("tags")
-    if not tags_val:
-        return False
-
-    if isinstance(tags_val, list):
-        tags_set = {str(t).lower() for t in tags_val}
-    elif isinstance(tags_val, str):
-        tags_set = {t.strip().lower() for t in tags_val.split(",") if t.strip()}
-    else:
-        tags_set = set()
-
-    return any(t in EXCLUDED_TAGS for t in tags_set)
-
-
-def is_market_included(cur, market_id):
-    """If INCLUDED_TAGS is non-empty, require at least one overlapping tag."""
-    if not INCLUDED_TAGS:
-        return True
-
-    cur.execute(
-        "SELECT tags FROM markets WHERE market_id = %s LIMIT 1",
-        (market_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return False
-
-    tags_val = row.get("tags")
-    if isinstance(tags_val, list):
-        tags_set = {str(t).lower() for t in tags_val}
-    elif isinstance(tags_val, str):
-        tags_set = {t.strip().lower() for t in tags_val.split(",") if t.strip()}
-    else:
-        tags_set = set()
-
-    return bool(tags_set & INCLUDED_TAGS)
-
-
-def has_market_pnl_capacity(cur, market_id):
-    """
-    Returns (ok: bool, total_pnl: Decimal).
-    If cumulative closed PnL for this strategy+market is below -MARKET_MAX_DRAWDOWN_USD,
-    we stop opening new positions in this market.
-    """
-    if MARKET_MAX_DRAWDOWN_USD <= 0:
-        return True, Decimal("0")
-
-    cur.execute(
-        """
-        SELECT COALESCE(SUM(pnl), 0) AS total_pnl
-        FROM mr_positions
-        WHERE strategy = %s
-          AND market_id = %s
-          AND status = 'closed'
-        """,
-        (STRATEGY, market_id),
-    )
-    row = cur.fetchone() or {}
-    total_pnl = to_dec(row.get("total_pnl"), Decimal("0"))
-
-    if total_pnl <= -MARKET_MAX_DRAWDOWN_USD:
-        return False, total_pnl
-    return True, total_pnl
-
-
-def market_has_excluded_tag_v2(cur, market_id):
-    """
-    Checks v2-specific excluded tags (case-sensitive matches).
-    """
-    if not MR2_EXCLUDED_TAGS_SET:
-        return False
-    cur.execute(
-        "SELECT tags FROM markets WHERE market_id = %s LIMIT 1",
-        (market_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return False
-    tags_val = row.get("tags")
-    if isinstance(tags_val, list):
-        tags = [str(t).strip() for t in tags_val]
-    elif isinstance(tags_val, str):
-        tags = [t.strip() for t in tags_val.split(",")]
-    else:
-        tags = []
-    return any(t in MR2_EXCLUDED_TAGS_SET for t in tags if t)
-
-
-def is_market_valid(cur, market_id):
-    """
-    Validate market before trading:
-    - Must exist
-    - Must have a reasonable question if required
-    - Must not match excluded keywords
-    - Must not be resolving within 6 hours (if resolve_ts available)
-    """
-    cur.execute(
-        """
-        SELECT question, tags, resolve_ts
-        FROM markets
-        WHERE market_id = %s
-        LIMIT 1
-        """,
-        (market_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        return False, "not_in_db"
-
-    question = (row.get("question") or "").strip()
-
-    if REQUIRE_QUESTION and len(question) < 10:
-        return False, "no_question"
-
-    # keyword blacklist: use cached EXCLUDED_KEYWORDS
-    if question and EXCLUDED_KEYWORDS:
-        qlow = question.lower()
-        for kw in EXCLUDED_KEYWORDS:
-            if kw in qlow:
-                return False, f"keyword_{kw}"
-
-    # Check resolve_ts if present
-    end_ts = row.get("resolve_ts")
-    if end_ts:
-        try:
-            if isinstance(end_ts, str):
-                end_ts = datetime.fromisoformat(end_ts)
-            hours_left = (end_ts - datetime.now(timezone.utc)).total_seconds() / 3600
-            if hours_left < 6:
-                return False, "ending_soon"
-        except Exception:
-            pass
-
-    return True, None
-
-
-def detect_volatility_collapse(cur, market_id, outcome):
-    """
-    Leading indicator: stddev collapses from prior 3h to recent 1h.
-    Returns (collapsed: bool, drop_pct: float)
-    """
-    cur.execute(
-        """
-        SELECT 
-            STDDEV(price) FILTER (WHERE ts >= NOW() - INTERVAL '1 hour') AS vol_1h,
-            STDDEV(price) FILTER (WHERE ts >= NOW() - INTERVAL '4 hours' AND ts < NOW() - INTERVAL '1 hour') AS vol_3h_prior,
-            COUNT(*) FILTER (WHERE ts >= NOW() - INTERVAL '1 hour') AS trades_1h,
-            COUNT(*) FILTER (WHERE ts >= NOW() - INTERVAL '4 hours' AND ts < NOW() - INTERVAL '1 hour') AS trades_3h
-        FROM raw_trades
-        WHERE market_id = %s AND outcome = %s
-          AND ts >= NOW() - INTERVAL '4 hours'
-        """,
-        (market_id, outcome),
-    )
-    row = cur.fetchone() or {}
-    vol_recent = float(row.get("vol_1h") or 0)
-    vol_prior = float(row.get("vol_3h_prior") or 0)
-    trades_1h = int(row.get("trades_1h") or 0)
-    trades_3h = int(row.get("trades_3h") or 0)
-
-    # Require minimum sample size to avoid noise on illiquid markets
-    if trades_1h < 10 or trades_3h < 30:
-        return False, 0.0
-
-    if vol_prior <= 0 or vol_recent <= 0:
-        return False, 0.0
-    drop_pct = (vol_prior - vol_recent) / vol_prior
-    return (drop_pct > 0.60), drop_pct
-
-
-def detect_volume_spike(cur, market_id, outcome):
-    """
-    Concurrent indicator: 1h trade count vs prior 24h hourly average (excluding last hour).
-    Returns (spike: bool, ratio: float)
-    """
-    cur.execute(
-        """
-        WITH recent AS (
-            SELECT COUNT(*) AS trades_1h
-            FROM raw_trades
-            WHERE market_id = %s AND outcome = %s
-              AND ts >= NOW() - INTERVAL '1 hour'
-        ),
-        hist AS (
-            SELECT AVG(cnt) AS avg_trades
-            FROM (
-                SELECT COUNT(*) AS cnt
-                FROM raw_trades
-                WHERE market_id = %s AND outcome = %s
-                  AND ts >= NOW() - INTERVAL '25 hours'
-                  AND ts < NOW() - INTERVAL '1 hour'
-                GROUP BY DATE_TRUNC('hour', ts)
-            ) x
-        )
-        SELECT trades_1h, avg_trades FROM recent, hist;
-        """,
-        (market_id, outcome, market_id, outcome),
-    )
-    row = cur.fetchone() or {}
-    trades_1h = float(row.get("trades_1h") or 0)
-    avg_trades = float(row.get("avg_trades") or 0)
-    if avg_trades <= 0:
-        return False, 0.0
-    ratio = trades_1h / avg_trades
-    return (ratio > 4.0), ratio
-
-
-def get_top_markets(cur):
-    """Get top markets by 24h volume, excluding sports/invalid/keywords"""
-    query = """
-        SELECT 
-            rt.market_id,
-            SUM(COALESCE(rt.value_usd, rt.price * rt.qty, 0)) AS volume_24h
-        FROM raw_trades rt
-        JOIN markets m ON m.market_id = rt.market_id
-        WHERE rt.ts >= NOW() - INTERVAL '24 hours'
-    """
-
-    filters = []
-    params = []
-
-    if REQUIRE_QUESTION:
-        filters.append("m.question IS NOT NULL")
-        filters.append("LENGTH(TRIM(m.question)) >= 10")
-
-    if filters:
-        query += " AND " + " AND ".join(filters)
-
-    query += """
-        GROUP BY rt.market_id
-        HAVING SUM(COALESCE(rt.value_usd, rt.price * rt.qty, 0)) >= %s
-        ORDER BY volume_24h DESC
-        LIMIT %s
-    """
-    params.extend([MIN_VOLUME_24H, TOP_MARKETS * 3])  # over-fetch, then filter
-
-    cur.execute(query, params)
-
-    markets = []
-    for row in cur.fetchall():
-        mid = row["market_id"]
-
-        if is_market_excluded(cur, mid):
-            continue
-
-        if not is_market_included(cur, mid):
-            continue
-
-        ok, reason = is_market_valid(cur, mid)
-        if not ok:
-            continue
-
-        markets.append(mid)
-        if len(markets) >= TOP_MARKETS:
-            break
-
-    return markets
-
-
-def get_market_stats(cur, market_id, outcome, now_ts):
-    """Get current price and rolling average for a market/outcome.
-
-    Fallbacks:
-      - If 18h average is missing, retry with a 72h window.
-      - If still missing but we have a current price, use that as the avg proxy.
-    This reduces no_price rejections on sparsely traded markets when ingestion
-    had gaps.
-    """
-    start_18h = now_ts - timedelta(hours=AVG_WINDOW_HOURS)
-
-    def avg_in_window(start_ts):
-        cur.execute(
-            """
-            SELECT AVG(price) as avg_price
-            FROM raw_trades
-            WHERE market_id = %s 
-              AND outcome = %s
-              AND ts >= %s 
-              AND ts < %s
-            """,
-            (market_id, outcome, start_ts, now_ts),
-        )
-        row = cur.fetchone()
-        return to_dec(row["avg_price"]) if row and row["avg_price"] else None
-
-    avg_price = avg_in_window(start_18h)
-    if avg_price is None:
-        # Try a wider lookback to handle sparse markets / ingest gaps
-        avg_price = avg_in_window(now_ts - timedelta(hours=72))
-
-    # Get current price (latest trade)
-    cur.execute(
-        """
-        SELECT price
-        FROM raw_trades
-        WHERE market_id = %s 
-          AND outcome = %s
-        ORDER BY ts DESC
-        LIMIT 1
-        """,
-        (market_id, outcome),
-    )
-    row = cur.fetchone()
-    current_price = to_dec(row["price"]) if row else None
-
-    # If we have a current price but no avg, use current as proxy
-    if current_price is not None and avg_price is None:
-        avg_price = current_price
-
-    return current_price, avg_price
-
-
-def can_open_position(cur, market_id, outcome, now_ts):
-    """Check if we can open a new position"""
-    global LAST_MARKET_CLOSE
-
-    # Check per market loss streak
-    streak_key = (STRATEGY, market_id, outcome)
-    if MARKET_LOSS_STREAK[streak_key] >= MAX_LOSS_STREAK:
-        return False, "loss_streak"
-
-    ok_pnl, total_pnl = has_market_pnl_capacity(cur, market_id)
-    if not ok_pnl:
-        return False, "market_dd"
-    
-    # Check cooldown
-    key = (market_id, outcome)
-    last_close = LAST_MARKET_CLOSE[key]
-    if (now_ts - last_close).total_seconds() < MARKET_COOLDOWN_SECS:
-        return False, "cooldown"
-    
-    # Check total open positions
-    cur.execute(
-        """
-        SELECT COUNT(*) as count
-        FROM mr_positions
-        WHERE strategy = %s AND status = 'open'
-        """,
-        (STRATEGY,),
-    )
-    row = cur.fetchone()
-    if row and row["count"] >= MAX_OPEN_POSITIONS:
-        return False, "max_global"
-    
-    # Check positions in this market/outcome
-    cur.execute(
-        """
-        SELECT COUNT(*) as count
-        FROM mr_positions
-        WHERE strategy = %s 
-          AND status = 'open'
-          AND market_id = %s
-          AND outcome = %s
-        """,
-        (STRATEGY, market_id, outcome),
-    )
-    row = cur.fetchone()
-    if row and row["count"] >= MAX_POSITIONS_PER_MARKET:
-        return False, "max_market"
-    
-    return True, None
-
-
-def open_position(cur, market_id, outcome, entry_price, avg_price, dislocation, now_ts):
-    """Open a new long position"""
-    size = BASE_POSITION_USD / entry_price
-    
-    cur.execute(
-        """
-        INSERT INTO mr_positions (
-            strategy,
-            market_id,
-            outcome,
-            side,
-            entry_price,
-            entry_ts,
-            size,
-            avg_price_18h,
-            dislocation,
-            status
-        )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'open')
-        RETURNING id
-        """,
-        (
-            STRATEGY,
-            market_id,
-            outcome,
-            "long",
-            entry_price,
-            now_ts,
-            size,
-            avg_price,
-            dislocation,
-        ),
-    )
-    row = cur.fetchone()
-    return row["id"] if row else None
-
-
-def close_position(cur, pos, exit_price, exit_reason, now_ts):
-    """Close an open position"""
-    global DAILY_PNL, LAST_MARKET_CLOSE
-    
-    entry_price = to_dec(pos["entry_price"])
-    size = to_dec(pos["size"])
-    
-    # Long only: profit when price goes up
-    pnl = (exit_price - entry_price) * size
-    
-    cur.execute(
-        """
-        UPDATE mr_positions
-        SET
-            status = 'closed',
-            exit_price = %s,
-            exit_ts = %s,
-            exit_reason = %s,
-            pnl = %s
-        WHERE id = %s
-        """,
-        (exit_price, now_ts, exit_reason, pnl, pos["id"]),
-    )
-    
-    # Update tracking
-    DAILY_PNL += pnl
-    key = (pos["market_id"], pos["outcome"])
-    LAST_MARKET_CLOSE[key] = now_ts
-
-    # Update per market loss streak
-    streak_key = (pos["strategy"], pos["market_id"], pos["outcome"])
-    if pnl < 0:
-        MARKET_LOSS_STREAK[streak_key] += 1
-        if MARKET_LOSS_STREAK[streak_key] >= MAX_LOSS_STREAK:
-            print(
-                f"{LOG_PREFIX} LOSS STREAK: {pos['market_id'][:16]}.../{pos['outcome']} "
-                f"banned after {MARKET_LOSS_STREAK[streak_key]} consecutive losses"
-            )
-    else:
-        # Any non negative result resets the streak
-        MARKET_LOSS_STREAK[streak_key] = 0
-
-    # Track v2 per-market PnL
-    if pos.get("strategy") == STRATEGY_MEAN_REV_V2:
-        MARKET_REALIZED_PNL_V2[pos["market_id"]] += pnl
-    
-    return float(pnl)
-
-
-def log_shadow_fill(cur, market_id, outcome, side, size, signal_price, sim_entry_price, avg_price, dislocation, now_ts, notes=None):
-    """
-    Log a 'shadow' execution for mean_reversion_v1:
-    - This does NOT affect positions or PnL.
-    - It just records what we *would* have done at this moment.
-    """
-    cur.execute(
-        """
-        INSERT INTO mr_shadow_fills (
-            strategy,
-            market_id,
-            outcome,
-            side,
-            ts,
-            size,
-            signal_price,
-            sim_entry_price,
-            avg_price_18h,
-            dislocation,
-            notes
-        )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """,
-        (
-            STRATEGY,
-            market_id,
-            outcome,
-            side,
-            now_ts,
-            size,
-            signal_price,
-            sim_entry_price,
-            avg_price,
-            dislocation,
-            notes,
-        ),
-    )
-
-
-def scan_for_entries(cur, markets, now_ts):
-    """Scan markets for entry opportunities"""
-    entries = 0
-    filter_counts = defaultdict(int)
-    
-    for market_id in markets:
-        valid, reason = is_market_valid(cur, market_id)
-        if not valid:
-            filter_counts[f"invalid_{reason}"] += 1
-            continue
-
-        # Get both outcomes
-        for outcome in ["0", "1"]:
-            # Collapse / spike filters (avoid collapsing markets)
-            vol_collapsed, vol_drop = detect_volatility_collapse(cur, market_id, outcome)
-            if vol_collapsed:
-                filter_counts["avoid_vol_collapse"] += 1
-                # lightweight logging for first few hits
-                if filter_counts["avoid_vol_collapse"] <= 3:
-                    print(f"{LOG_PREFIX} FILTER: {market_id[:16]}.../{outcome} volatility dropped {vol_drop*100:.0f}%")
-                continue
-
-            vol_spike, vol_ratio = detect_volume_spike(cur, market_id, outcome)
-            if vol_spike:
-                filter_counts["avoid_volume_spike"] += 1
-                if filter_counts["avoid_volume_spike"] <= 3:
-                    print(f"{LOG_PREFIX} FILTER: {market_id[:16]}.../{outcome} volume spike {vol_ratio:.1f}x")
-                continue
-
-            current_price, avg_price = get_market_stats(cur, market_id, outcome, now_ts)
-            
-            if current_price is None or avg_price is None:
-                filter_counts["no_price"] += 1
-                continue
-            
-            if avg_price <= 0:
-                filter_counts["bad_avg"] += 1
-                continue
-            
-            # Check price range
-            if current_price < MIN_PRICE or current_price > MAX_PRICE:
-                filter_counts["price_range"] += 1
-                continue
-            
-            # Calculate dislocation
-            dislocation = (current_price - avg_price) / avg_price
-            
-            # LONGS ONLY: price must be BELOW average
-            if dislocation >= 0:
-                filter_counts["not_dislocation"] += 1
-                continue
-            
-            # Check dislocation threshold
-            if abs(dislocation) < DISLOCATION_THRESHOLD:
-                filter_counts["too_small"] += 1
-                continue
-            
-            if abs(dislocation) > MAX_DISLOCATION:
-                filter_counts["too_extreme"] += 1
-                continue
-
-            # Additional v2-only filters
-            if STRATEGY == STRATEGY_MEAN_REV_V2:
-                # Per-market PnL cap
-                if MARKET_REALIZED_PNL_V2.get(market_id, Decimal("0")) <= -MR2_MARKET_MAX_LOSS_USD:
-                    filter_counts["mr2_market_pnl_cap"] += 1
-                    continue
-
-                # Entry price cap (apply to slippage-adjusted price)
-                projected_entry = current_price * (Decimal("1") + SLIPPAGE)
-                if projected_entry > MR2_MAX_ENTRY_PX:
-                    filter_counts["mr2_price_cap"] += 1
-                    continue
-
-                # Dislocation floor (skip ultra-deep dips)
-                if dislocation <= MR2_MIN_DISLOCATION:
-                    filter_counts["mr2_dislocation_too_deep"] += 1
-                    continue
-
-                # Tag blacklist
-                if market_has_excluded_tag_v2(cur, market_id):
-                    filter_counts["mr2_excluded_tag"] += 1
-                    continue
-            
-            # Check if we can open
-            can_open, reason = can_open_position(cur, market_id, outcome, now_ts)
-            if not can_open:
-                filter_counts[f"cant_open_{reason}"] += 1
-                continue
-            
-            # Apply entry slippage (buying = pay higher)
-            entry_price = current_price * (Decimal("1") + SLIPPAGE)
-            size = BASE_POSITION_USD / entry_price
-
-            # NEW: log a shadow fill for this potential execution
-            try:
-                log_shadow_fill(
-                    cur=cur,
-                    market_id=market_id,
-                    outcome=outcome,
-                    side="long",
-                    size=size,
-                    signal_price=current_price,
-                    sim_entry_price=entry_price,
-                    avg_price=avg_price,
-                    dislocation=dislocation,
-                    now_ts=now_ts,
-                    notes="mr_v1_shadow"
-                )
-            except Exception as e:
-                # Keep it non-fatal; shadow logging must not break trading loop
-                print(f"{LOG_PREFIX} Shadow fill logging error for {market_id[:16]}.../{outcome}: {e}")
-
-            # Open position (paper, as before)
-            pos_id = open_position(cur, market_id, outcome, entry_price, avg_price, dislocation, now_ts)
-            if pos_id:
-                entries += 1
-                print(
-                    f"{LOG_PREFIX} ENTRY #{pos_id}: {market_id[:16]}.../{outcome} @ {float(entry_price):.4f} "
-                    f"(avg={float(avg_price):.4f}, dislo={float(dislocation)*100:.1f}%)"
-                )
-    
-    if entries > 0 or sum(filter_counts.values()) > 0:
-        print(f"{LOG_PREFIX} Scan: {entries} entries, filters: {dict(filter_counts)}")
-    
-    return entries
-
-
-def process_exits(cur, now_ts):
-    """Check and execute exits for open positions"""
-    cur.execute(
-        """
-        SELECT *
-        FROM mr_positions
-        WHERE strategy = %s AND status = 'open'
-        """,
-        (STRATEGY,),
-    )
-    
-    positions = cur.fetchall()
-    exit_counts = defaultdict(int)
-    
-    for pos in positions:
-        market_id = pos["market_id"]
-        outcome = pos["outcome"]
-        entry_price = to_dec(pos["entry_price"])
-        
-        # Get current price
-        cur.execute(
-            """
-            SELECT price
-            FROM raw_trades
-            WHERE market_id = %s AND outcome = %s
-            ORDER BY ts DESC
-            LIMIT 1
-            """,
-            (market_id, outcome),
-        )
+    mid = norm_market_id(market_id)
+    try:
+        cur.execute("SELECT tags FROM markets WHERE market_id = %s LIMIT 1", (mid,))
         row = cur.fetchone()
         if not row:
-            continue
-        
-        current_price = to_dec(row["price"])
-        if not current_price:
-            continue
-        
-        # Calculate P&L percentage based on current mid/last
-        pnl_pct = (current_price - entry_price) / entry_price
-        
-        # Apply exit slippage (selling = receive lower)
-        exit_price = current_price * (Decimal("1") - SLIPPAGE)
+            return False
+        tags_val = row.get("tags")
+        if not tags_val:
+            return False
 
-        # Hard maximum stop loss cap based on realized exit_price
-        realized_pnl_pct = (exit_price - entry_price) / entry_price
-        if realized_pnl_pct <= -MAX_STOP_LOSS_PCT:
-            pnl = close_position(cur, pos, exit_price, "max_sl", now_ts)
-            exit_counts["max_sl"] += 1
-            print(
-                f"{LOG_PREFIX} EXIT MAX_SL: #{pos['id']} {market_id[:16]}.../{outcome} "
-                f"@ {float(exit_price):.4f} P&L: ${pnl:.2f} "
-                f"({float(realized_pnl_pct)*100:.1f}%) - HARD CAP HIT"
+        if isinstance(tags_val, list):
+            tags = {str(t).strip().lower() for t in tags_val if str(t).strip()}
+        elif isinstance(tags_val, str):
+            tags = {t.strip().lower() for t in tags_val.split(",") if t.strip()}
+        else:
+            tags = set()
+
+        return bool(tags & EXCLUDED_TAGS)
+    except Exception:
+        return False
+
+# =========================
+# MARKET RISK STATE
+# =========================
+
+def load_market_state(cur, market_id):
+    mid = norm_market_id(market_id)
+    cur.execute("""
+        SELECT * FROM mr_market_risk_state
+        WHERE strategy = %s AND market_id = %s
+    """, (STRATEGY, mid))
+    return cur.fetchone()
+
+def upsert_market_state(cur, market_id, **fields):
+    mid = norm_market_id(market_id)
+
+    cols = ", ".join(fields.keys())
+    vals = list(fields.values())
+    sets = ", ".join(f"{k}=EXCLUDED.{k}" for k in fields)
+
+    cur.execute(f"""
+        INSERT INTO mr_market_risk_state (strategy, market_id, {cols})
+        VALUES (%s, %s, {",".join(["%s"] * len(vals))})
+        ON CONFLICT (strategy, market_id)
+        DO UPDATE SET {sets}, updated_at = NOW()
+    """, [STRATEGY, mid] + vals)
+
+def normalize_ban_state(cur, market_id, now_ts):
+    row = load_market_state(cur, market_id)
+    if row and row["banned"] and row["banned_until"]:
+        if now_ts >= row["banned_until"]:
+            upsert_market_state(
+                cur,
+                market_id,
+                banned=False,
+                banned_until=None,
+                banned_reason=None,
             )
+
+def ban_market(cur, market_id, now_ts, reason, permanent=True):
+    mid = norm_market_id(market_id)
+
+    # Step 2: idempotent ban (avoid repeated re-bans / log spam)
+    try:
+        row = load_market_state(cur, mid)
+        if row and row.get("banned"):
+            already_permanent = row.get("banned_until") is None
+            same_reason = (row.get("banned_reason") or "") == (reason or "")
+            if permanent and already_permanent and same_reason:
+                return
+    except Exception:
+        pass
+
+    banned_until = None
+    if not permanent:
+        banned_until = now_ts + timedelta(seconds=MR_STALE_BAN_SECS)
+
+    upsert_market_state(
+        cur,
+        mid,
+        banned=True,
+        banned_until=banned_until,
+        banned_reason=reason,
+    )
+
+    print(
+        f"{LOG_PREFIX} MARKET BANNED {mid[:16]} "
+        f"reason={reason} permanent={permanent}"
+    )
+
+def is_market_banned(cur, market_id, now_ts):
+    mid = norm_market_id(market_id)
+    normalize_ban_state(cur, mid, now_ts)
+    row = load_market_state(cur, mid)
+    return bool(row and row["banned"])
+
+# =========================
+# EQUITY / DRAW DOWN
+# =========================
+
+def compute_market_equity(cur, market_id, now_ts):
+    """
+    Equity = realized + unrealized (mark-to-market).
+    Stale/missing prices are treated as missing and use conservative fallback.
+    """
+    mid = norm_market_id(market_id)
+    cur.execute("""
+        SELECT * FROM mr_positions
+        WHERE strategy = %s AND market_id = %s
+    """, (STRATEGY, mid))
+
+    realized = Decimal("0")
+    unreal = Decimal("0")
+
+    for p in (cur.fetchall() or []):
+        entry_px = Decimal(p["entry_price"])
+        size = Decimal(p["size"])
+
+        if p["status"] == "closed":
+            realized += Decimal(p["pnl"] or 0)
             continue
 
-        # Early exit if market shows collapse after we're in and we're losing
-        elapsed_hours = (now_ts - pos["entry_ts"]).total_seconds() / 3600
-        if elapsed_hours >= 1 and pnl_pct < -Decimal("0.05"):
-            vol_collapsed, vol_drop = detect_volatility_collapse(cur, market_id, outcome)
-            if vol_collapsed:
-                pnl = close_position(cur, pos, exit_price, "vol_collapse_exit", now_ts)
-                exit_counts["vol_collapse_exit"] += 1
-                print(f"{LOG_PREFIX} EXIT VOL_COLLAPSE: #{pos['id']} {market_id[:16]}.../{outcome} "
-                      f"P&L: ${pnl:.2f} (vol drop {vol_drop*100:.0f}%)")
+        cached = get_last_price_cached(mid, p["outcome"])
+        valid = False
+        px = None
+        if cached:
+            px, ts = cached
+            if not is_price_stale(ts, now_ts):
+                valid = True
+
+        if not valid:
+            fallback_px = entry_px * (Decimal("1") - MAX_STOP_LOSS_PCT)
+            exit_px = fallback_px * (Decimal("1") - SLIPPAGE)
+        else:
+            exit_px = px * (Decimal("1") - SLIPPAGE)
+
+        unreal += (exit_px - entry_px) * size
+
+    return realized + unreal
+
+def update_market_dd_state(cur, market_id, now_ts):
+    """
+    If (peak_equity - equity) >= limit, permanently ban the market.
+    limit is fraction of BASE_POSITION_USD (configurable).
+    """
+    mid = norm_market_id(market_id)
+    equity = compute_market_equity(cur, mid, now_ts)
+    row = load_market_state(cur, mid)
+
+    peak = to_dec(row["peak_equity"], Decimal("0")) if row else Decimal("0")
+    peak = max(peak, equity)
+
+    limit = (BASE_POSITION_USD * MR_MARKET_DD_FRACTION)
+    dd = peak - equity
+
+    upsert_market_state(
+        cur,
+        mid,
+        peak_equity=peak,
+        last_equity=equity,
+    )
+
+    if dd >= limit:
+        ban_market(cur, mid, now_ts, "drawdown", permanent=True)
+
+# =========================
+# FORCE CLOSE PERMA-KILLED MARKETS
+# =========================
+
+def force_close_killed_markets(cur, now_ts):
+    """
+    Force close all OPEN positions for permanently banned markets.
+    If no fresh price, close at conservative fallback.
+    """
+    cur.execute("""
+        SELECT * FROM mr_positions
+        WHERE strategy = %s AND status = 'open'
+    """, (STRATEGY,))
+
+    for p in (cur.fetchall() or []):
+        market_id = norm_market_id(p["market_id"])
+        state = load_market_state(cur, market_id)
+
+        # Only permanent bans: banned=True and banned_until is NULL
+        if not state or not state["banned"] or state["banned_until"]:
+            continue
+
+        entry_px = Decimal(p["entry_price"])
+        size = Decimal(p["size"])
+
+        cached = get_last_price_cached(market_id, p["outcome"])
+        if cached and not is_price_stale(cached[1], now_ts):
+            exit_px = cached[0] * (Decimal("1") - SLIPPAGE)
+        else:
+            fallback_px = entry_px * (Decimal("1") - MAX_STOP_LOSS_PCT)
+            exit_px = fallback_px * (Decimal("1") - SLIPPAGE)
+
+        pnl = (exit_px - entry_px) * size
+
+        cur.execute("""
+            UPDATE mr_positions
+            SET status='closed',
+                exit_price=%s,
+                exit_ts=%s,
+                exit_reason='market_kill',
+                pnl=%s
+            WHERE id=%s
+        """, (exit_px, now_ts, pnl, p["id"]))
+
+        print(
+            f"{LOG_PREFIX} FORCE EXIT #{p['id']} "
+            f"{market_id[:16]} pnl=${float(pnl):.2f}"
+        )
+
+# =========================
+# MARKET SELECTION
+# =========================
+
+def get_top_markets(cur, now_ts):
+    """
+    Top markets by 24h volume.
+    Requires BOTH outcomes (0/1) to be present AND fresh.
+    Uses COALESCE(value_usd, price*qty, 0) to be robust to schema differences.
+    """
+    cur.execute("""
+        WITH per_outcome AS (
+            SELECT
+                rt.market_id,
+                rt.outcome,
+                SUM(COALESCE(rt.value_usd, rt.price * rt.qty, 0)) AS vol_24h,
+                MAX(rt.ts) AS last_ts
+            FROM raw_trades rt
+            WHERE rt.ts >= %s - INTERVAL '24 hours'
+              AND rt.ts < %s
+              AND rt.outcome IN ('0','1')
+            GROUP BY rt.market_id, rt.outcome
+        ),
+        per_market AS (
+            SELECT
+                market_id,
+                SUM(vol_24h) AS volume_24h,
+                MIN(last_ts) AS min_last_ts,
+                COUNT(DISTINCT outcome) AS outcomes_seen
+            FROM per_outcome
+            GROUP BY market_id
+        )
+        SELECT
+            market_id,
+            volume_24h,
+            min_last_ts AS last_trade_ts
+        FROM per_market
+        WHERE volume_24h >= %s
+          AND outcomes_seen = 2
+          AND min_last_ts >= %s - make_interval(secs => %s)
+        ORDER BY volume_24h DESC
+        LIMIT %s
+    """, (now_ts, now_ts, MIN_VOLUME_24H, now_ts, MR_PRICE_STALE_SECS, TOP_MARKETS))
+
+    markets = [norm_market_id(r["market_id"]) for r in (cur.fetchall() or [])]
+    filtered = []
+
+    # Pull questions in one query and filter by keyword blacklist
+    qmap = {}
+    try:
+        cur.execute(
+            "SELECT market_id, question FROM markets WHERE market_id = ANY(%s)",
+            (markets,)
+        )
+        for r in (cur.fetchall() or []):
+            qmap[norm_market_id(r.get("market_id"))] = (r.get("question") or "")
+    except Exception:
+        qmap = {}
+
+    for mid in markets:
+        if is_market_excluded_by_tags(cur, mid):
+            continue
+        q = qmap.get(mid, "")
+        kw = first_blocking_keyword(q)
+        if kw:
+            print(f"{LOG_PREFIX} SKIP_KW {mid[:16]} kw={kw} q={q[:90]}")
+            continue
+        filtered.append(mid)
+
+    print(f"{LOG_PREFIX} TOP_MARKETS raw={len(markets)} after_filters={len(filtered)}")
+    return filtered
+
+# =========================
+# ENTRY LOGIC (COUNT CACHED)
+# =========================
+
+def scan_and_open(cur, markets, now_ts):
+    """
+    COUNT-cached entry scanning:
+    - 1 query for global open count
+    - 1 query for (market_id, outcome) open counts
+    Then update local cache on each insert.
+
+    Also:
+    - Filters banned markets early
+    - Cooldown bans stale markets early (market-level)
+    """
+    counters = defaultdict(int)
+    entries = 0
+
+    # Cache global count once
+    cur.execute("""
+        SELECT COUNT(*) AS c
+        FROM mr_positions
+        WHERE strategy = %s AND status = 'open'
+    """, (STRATEGY,))
+    global_count = int((cur.fetchone() or {}).get("c") or 0)
+    if global_count >= MAX_OPEN_POSITIONS:
+        counters["cap_global"] += 1
+        print(f"{LOG_PREFIX} SCAN_SUMMARY markets_in={len(markets)} tradable=0 entries=0 cap_global=1")
+        return
+
+    # Cache per (market,outcome) open counts once
+    cur.execute("""
+        SELECT market_id, outcome, COUNT(*) AS c
+        FROM mr_positions
+        WHERE strategy = %s AND status = 'open'
+        GROUP BY market_id, outcome
+    """, (STRATEGY,))
+    pos_counts = defaultdict(int)
+    for r in (cur.fetchall() or []):
+        pos_counts[(norm_market_id(r["market_id"]), str(r["outcome"]).strip())] = int(r["c"] or 0)
+
+    # Filter banned markets before doing any work
+    active_markets = []
+    for m in markets:
+        mid = norm_market_id(m)
+        if is_market_banned(cur, mid, now_ts):
+            counters["market_banned"] += 1
+            continue
+        active_markets.append(mid)
+
+    # Market-level stale cooldown bans
+    tradable_markets = []
+    for mid in active_markets:
+        if market_has_stale_price(mid, now_ts):
+            counters["market_stale"] += 1
+            ban_market(cur, mid, now_ts, "stale_price", permanent=False)
+            continue
+        tradable_markets.append(mid)
+
+    for mid in tradable_markets:
+        if global_count >= MAX_OPEN_POSITIONS:
+            counters["cap_global_midloop"] += 1
+            break
+
+        # If DD perma-banned it earlier in this loop, skip
+        if is_market_banned(cur, mid, now_ts):
+            counters["market_banned_midloop"] += 1
+            continue
+
+        for outcome in ("0", "1"):
+            if global_count >= MAX_OPEN_POSITIONS:
+                counters["cap_global_outcome"] += 1
+                break
+
+            # Per market/outcome cap + dedup
+            if pos_counts[(mid, outcome)] >= MAX_POSITIONS_PER_MARKET:
+                counters["cap_per_market_outcome"] += 1
                 continue
-        
-        # Check take profit
-        if pnl_pct >= TAKE_PROFIT_PCT:
-            pnl = close_position(cur, pos, exit_price, "tp", now_ts)
-            exit_counts["tp"] += 1
-            print(f"{LOG_PREFIX} EXIT TP: #{pos['id']} {market_id[:16]}.../{outcome} @ {float(exit_price):.4f} "
-                  f"P&L: ${pnl:.2f} (+{float(pnl_pct)*100:.1f}%)")
-            continue
-        
-        # Check stop loss
-        if pnl_pct <= -STOP_LOSS_PCT:
-            pnl = close_position(cur, pos, exit_price, "sl", now_ts)
-            exit_counts["sl"] += 1
-            print(f"{LOG_PREFIX} EXIT SL: #{pos['id']} {market_id[:16]}.../{outcome} @ {float(exit_price):.4f} "
-                  f"P&L: ${pnl:.2f} ({float(pnl_pct)*100:.1f}%)")
-            continue
-        
-        # Check time limit
-        if elapsed_hours >= MAX_HOLD_HOURS:
-            pnl = close_position(cur, pos, exit_price, "time", now_ts)
-            exit_counts["time"] += 1
-            print(f"{LOG_PREFIX} EXIT TIME: #{pos['id']} {market_id[:16]}.../{outcome} @ {float(exit_price):.4f} "
-                  f"P&L: ${pnl:.2f} ({float(pnl_pct)*100:.1f}%) after {elapsed_hours:.1f}h")
-            continue
-    
-    if sum(exit_counts.values()) > 0:
-        print(f"{LOG_PREFIX} Exits: {dict(exit_counts)}")
 
+            cached = get_last_price_cached(mid, outcome)
+            if not cached:
+                counters["px_missing"] += 1
+                ban_market(cur, mid, now_ts, "stale_price", permanent=False)
+                continue
+            px, ts = cached
+            if is_price_stale(ts, now_ts):
+                counters["px_stale"] += 1
+                ban_market(cur, mid, now_ts, "stale_price", permanent=False)
+                continue
+
+            # Price guardrails
+            if px < MIN_PRICE or px > MAX_PRICE:
+                counters["px_oob"] += 1
+                continue
+
+            # 18h average aligned to now_ts
+            cur.execute("""
+                SELECT AVG(price) AS avg_price
+                FROM raw_trades
+                WHERE market_id=%s AND outcome=%s
+                  AND ts >= %s - INTERVAL '18 hours'
+                  AND ts < %s
+            """, (mid, outcome, now_ts, now_ts))
+
+            row = cur.fetchone() or {}
+            avg = to_dec(row.get("avg_price"), None)
+            if avg is None or avg <= 0:
+                counters["avg_missing"] += 1
+                continue
+
+            dislo = (px - avg) / avg
+
+            # Longs only: price must be below avg by threshold
+            if dislo >= 0:
+                counters["dislo_not_negative"] += 1
+                continue
+            if abs(dislo) < DISLOCATION_THRESHOLD:
+                counters["dislo_too_small"] += 1
+                continue
+            if abs(dislo) > MAX_DISLOCATION:
+                counters["dislo_too_big"] += 1
+                continue
+
+            entry_px = px * (Decimal("1") + SLIPPAGE)
+            size = BASE_POSITION_USD / entry_px
+
+            cur.execute("""
+                INSERT INTO mr_positions (strategy, market_id, outcome, side, entry_price, entry_ts, size, avg_price_18h, dislocation)
+                VALUES (%s,%s,%s,'long',%s,%s,%s,%s,%s)
+            """, (STRATEGY, mid, outcome, entry_px, now_ts, size, avg, dislo))
+
+            # Update caches
+            global_count += 1
+            pos_counts[(mid, outcome)] += 1
+            entries += 1
+
+            print(
+                f"{LOG_PREFIX} ENTRY {mid[:16]} {outcome} "
+                f"px={float(entry_px):.4f} dislo={float(dislo)*100:.1f}%"
+            )
+
+    # Print scan summary once per loop
+    parts = [f"{k}={v}" for k, v in sorted(counters.items())]
+    print(
+        f"{LOG_PREFIX} SCAN_SUMMARY markets_in={len(markets)} "
+        f"active={len(active_markets)} tradable={len(tradable_markets)} "
+        f"entries={entries} " + " ".join(parts)
+    )
+
+# =========================
+# EXIT LOGIC
+# =========================
+
+def close_position(cur, pos_id, exit_px, now_ts, reason, pnl):
+    cur.execute("""
+        UPDATE mr_positions
+        SET status='closed',
+            exit_price=%s,
+            exit_ts=%s,
+            exit_reason=%s,
+            pnl=%s
+        WHERE id=%s
+    """, (exit_px, now_ts, reason, pnl, pos_id))
+
+def process_exits(cur, now_ts):
+    """
+    Exit reasons:
+    - max_sl: hard cap using realized exit price (slippage applied)
+    - tp: take profit
+    - sl: stop loss
+    - time: time stop
+    """
+    cur.execute("""
+        SELECT * FROM mr_positions
+        WHERE strategy=%s AND status='open'
+    """, (STRATEGY,))
+
+    for p in (cur.fetchall() or []):
+        market_id = norm_market_id(p["market_id"])
+        outcome = str(p["outcome"]).strip()
+        entry = Decimal(p["entry_price"])
+        size = Decimal(p["size"])
+        entry_ts = p["entry_ts"]
+
+        cached = get_last_price_cached(market_id, outcome)
+        if not cached or is_price_stale(cached[1], now_ts):
+            # Do not close on stale quotes (risk layer handles stale via bans)
+            continue
+
+        mkt_px, _ = cached
+        exit_px = mkt_px * (Decimal("1") - SLIPPAGE)
+
+        pnl_pct_mid = (mkt_px - entry) / entry
+        realized_pnl_pct = (exit_px - entry) / entry
+
+        # Hard max stop loss based on realized price
+        if realized_pnl_pct <= -MAX_STOP_LOSS_PCT:
+            pnl = (exit_px - entry) * size
+            close_position(cur, p["id"], exit_px, now_ts, "max_sl", pnl)
+            print(f"{LOG_PREFIX} EXIT max_sl #{p['id']} pnl=${float(pnl):.2f}")
+            continue
+
+        # Time exit
+        elapsed_hours = (now_ts - entry_ts).total_seconds() / 3600
+        if elapsed_hours >= MAX_HOLD_HOURS:
+            pnl = (exit_px - entry) * size
+            close_position(cur, p["id"], exit_px, now_ts, "time", pnl)
+            print(f"{LOG_PREFIX} EXIT time #{p['id']} pnl=${float(pnl):.2f}")
+            continue
+
+        # TP/SL exits
+        if pnl_pct_mid >= TAKE_PROFIT_PCT:
+            pnl = (exit_px - entry) * size
+            close_position(cur, p["id"], exit_px, now_ts, "tp", pnl)
+            print(f"{LOG_PREFIX} EXIT tp #{p['id']} pnl=${float(pnl):.2f}")
+            continue
+
+        if pnl_pct_mid <= -STOP_LOSS_PCT:
+            pnl = (exit_px - entry) * size
+            close_position(cur, p["id"], exit_px, now_ts, "sl", pnl)
+            print(f"{LOG_PREFIX} EXIT sl #{p['id']} pnl=${float(pnl):.2f}")
+            continue
+
+# =========================
+# STATUS
+# =========================
 
 def print_status(cur):
-    """Print current status summary"""
-    global DAILY_PNL, DAILY_PNL_RESET
-    
-    now = datetime.now(timezone.utc)
-    
-    # Reset daily P&L at midnight
-    if now.date() > DAILY_PNL_RESET:
-        DAILY_PNL = Decimal("0")
-        DAILY_PNL_RESET = now.date()
-    
-    # Get position counts
-    cur.execute(
-        """
-        SELECT 
-            COUNT(*) FILTER (WHERE status = 'open') as open_count,
-            COUNT(*) FILTER (WHERE status = 'closed') as closed_count,
-            COUNT(*) FILTER (WHERE status = 'closed' AND pnl > 0) as winners,
-            ROUND(AVG(pnl) FILTER (WHERE status = 'closed')::numeric, 2) as avg_pnl,
-            ROUND(SUM(pnl) FILTER (WHERE status = 'closed')::numeric, 2) as total_pnl
+    cur.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE status='open') AS open_count,
+            COUNT(*) FILTER (WHERE status='closed') AS closed_count,
+            COUNT(*) FILTER (WHERE status='closed' AND pnl > 0) AS winners,
+            COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0) AS total_pnl
         FROM mr_positions
-        WHERE strategy = %s
-        """,
-        (STRATEGY,),
-    )
-    row = cur.fetchone()
-    
-    open_count = row["open_count"] or 0
-    closed_count = row["closed_count"] or 0
-    winners = row["winners"] or 0
-    avg_pnl = float(row["avg_pnl"]) if row["avg_pnl"] else 0.0
-    total_pnl = float(row["total_pnl"]) if row["total_pnl"] else 0.0
-    
-    win_rate = (winners / closed_count * 100) if closed_count > 0 else 0.0
-    
-    print(f"\n{LOG_PREFIX} === STATUS @ {now.strftime('%H:%M:%S')} ===")
-    print(f"{LOG_PREFIX} Open: {open_count} | Closed: {closed_count} (WR: {win_rate:.1f}%)")
-    print(f"{LOG_PREFIX} Avg P&L: ${avg_pnl:.2f} | Total: ${total_pnl:.2f} | Today: ${float(DAILY_PNL):.2f}")
-    print(f"{LOG_PREFIX} =============================\n")
+        WHERE strategy=%s
+    """, (STRATEGY,))
+    r = cur.fetchone() or {}
+    open_count = int(r.get("open_count") or 0)
+    closed_count = int(r.get("closed_count") or 0)
+    winners = int(r.get("winners") or 0)
+    total_pnl = float(r.get("total_pnl") or 0)
+    wr = (100.0 * winners / closed_count) if closed_count > 0 else 0.0
+    print(f"{LOG_PREFIX} STATUS open={open_count} closed={closed_count} WR={wr:.1f}% pnl=${total_pnl:.2f}")
 
+# =========================
+# MAIN LOOP
+# =========================
 
 def main():
-    global DAILY_PNL
-    
-    print(f"{LOG_PREFIX} Mean Reversion Executor Starting...")
-    print(f"{LOG_PREFIX} Strategy: {STRATEGY}")
-    print(f"{LOG_PREFIX} Settings: dislo={float(DISLOCATION_THRESHOLD)*100:.0f}%, tp={float(TAKE_PROFIT_PCT)*100:.0f}%, "
-          f"sl={float(STOP_LOSS_PCT)*100:.0f}%, hold={MAX_HOLD_HOURS}h, window={AVG_WINDOW_HOURS}h")
-    print(f"{LOG_PREFIX} Markets: top {TOP_MARKETS}, min vol ${float(MIN_VOLUME_24H):.0f}")
-    print(f"{LOG_PREFIX} Excluded: tags={EXCLUDED_TAGS}, categories={EXCLUDED_CATEGORIES}")
-    print(f"{LOG_PREFIX} Excluded keywords: {', '.join(EXCLUDED_KEYWORDS)}")
-    print(f"{LOG_PREFIX} Require question: {REQUIRE_QUESTION}")
-    print(f"{LOG_PREFIX} Limits: max {MAX_OPEN_POSITIONS} positions, ${float(DAILY_LOSS_LIMIT):.0f} daily loss limit")
-    
     conn = get_conn()
-    # Disable server-side prepared statements to avoid cached plan type errors after schema changes.
-    conn.prepare_threshold = None
-    # Enable autocommit up front to avoid in-transaction state when toggling.
-    conn.autocommit = True
-    ensure_tables(conn)
-    if STRATEGY == STRATEGY_MEAN_REV_V2:
-        load_market_pnls_for_mr_v2(conn)
-    
-    last_status_print = datetime.now(timezone.utc)
-    
-    try:
-        while True:
-            now_ts = datetime.now(timezone.utc)
-            
-            # Check circuit breaker
-            if DAILY_PNL < -DAILY_LOSS_LIMIT:
-                print(f"{LOG_PREFIX} CIRCUIT BREAKER: Daily loss ${float(DAILY_PNL):.2f} exceeds limit ${float(DAILY_LOSS_LIMIT):.2f}")
-                print(f"{LOG_PREFIX} Skipping new entries, processing exits only")
-                with conn.cursor() as cur:
-                    process_exits(cur, now_ts)
-                time.sleep(LOOP_SLEEP)
-                continue
-            
-            with conn.cursor() as cur:
-                # Get top markets
-                markets = get_top_markets(cur)
-                
-                # Scan for entries
-                scan_for_entries(cur, markets, now_ts)
-                
-                # Process exits
-                process_exits(cur, now_ts)
-                
-                # Print status every 5 minutes
-                if (now_ts - last_status_print).total_seconds() >= 300:
-                    print_status(cur)
-                    last_status_print = now_ts
-            
-            time.sleep(LOOP_SLEEP)
-    
-    except KeyboardInterrupt:
-        print(f"\n{LOG_PREFIX} Shutting down...")
-        with conn.cursor() as cur:
-            print_status(cur)
-    finally:
-        conn.close()
+    with conn.cursor() as cur:
+        ensure_tables(cur)
 
+    last_status = datetime.now(timezone.utc)
+
+    while True:
+        try:
+            now_ts = datetime.now(timezone.utc)
+            with conn.cursor() as cur:
+                # 1) Select candidate markets
+                markets = get_top_markets(cur, now_ts)
+
+                # 2) Build snapshot pairs: open positions + scan universe
+                cur.execute("""
+                    SELECT market_id, outcome
+                    FROM mr_positions
+                    WHERE strategy=%s AND status='open'
+                """, (STRATEGY,))
+                open_pairs = [(norm_market_id(r["market_id"]), str(r["outcome"]).strip()) for r in (cur.fetchall() or [])]
+
+                scan_pairs = []
+                for m in markets:
+                    scan_pairs.append((m, "0"))
+                    scan_pairs.append((m, "1"))
+
+                refresh_price_snapshot(cur, open_pairs + scan_pairs)
+
+                # 3) Update DD for markets we have exposure to (positions history)
+                cur.execute("""
+                    SELECT DISTINCT market_id
+                    FROM mr_positions
+                    WHERE strategy=%s
+                """, (STRATEGY,))
+                risk_markets = [norm_market_id(r["market_id"]) for r in (cur.fetchall() or [])]
+                for m in risk_markets:
+                    update_market_dd_state(cur, m, now_ts)
+
+                # 4) Force close permanently killed markets
+                force_close_killed_markets(cur, now_ts)
+
+                # 5) Entries
+                scan_and_open(cur, markets, now_ts)
+
+                # 6) Exits (tp/sl/time/max_sl)
+                process_exits(cur, now_ts)
+
+                # 7) Force close again (defensive: catches perma-bans that happened during this loop's activity)
+                force_close_killed_markets(cur, now_ts)
+
+                # Status every 5 minutes
+                if (now_ts - last_status).total_seconds() >= 300:
+                    print_status(cur)
+                    last_status = now_ts
+
+            time.sleep(LOOP_SLEEP)
+
+        except Exception as e:
+            print(f"{LOG_PREFIX} ERROR {e}")
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()

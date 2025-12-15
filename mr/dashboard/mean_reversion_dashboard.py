@@ -12,6 +12,8 @@ DB_URL = os.getenv("DB_URL")
 if not DB_URL:
     raise SystemExit("DB_URL not set")
 
+
+DASH_ENABLE_MR_V2 = os.getenv("DASH_ENABLE_MR_V2","1").strip().lower() in ("1","true","yes","y")
 app = Flask(__name__)
 
 REFRESH_SECS = 30
@@ -26,8 +28,12 @@ BOT_WARN_SECS = int(os.getenv("DASH_BOT_WARN_SECS", "600")) # yellow if activity
 LOG_MR_V1 = Path(os.getenv("DASH_LOG_MR_V1", "/root/polymarket-mean-reversion/logs/mr_v1.log"))
 LOG_MR_V2 = Path(os.getenv("DASH_LOG_MR_V2", "/root/polymarket-mean-reversion/logs/mr_v2.log"))
 
+DASH_ENABLE_MR_V2 = os.getenv("DASH_ENABLE_MR_V2","1") == "1"
+if not DASH_ENABLE_MR_V2:
+    LOG_MR_V2 = None
+
 # tmux sessions we expect
-EXPECTED_TMUX_SESSIONS = ["mr_v1", "mr_v2", "elwa_smartflow_full"]
+EXPECTED_TMUX_SESSIONS = [s.strip() for s in os.getenv("DASH_TMUX_SESSIONS","mr_v1,elwa_smartflow_full").split(",") if s.strip()]
 
 # available strategy filters
 STRATEGIES = [
@@ -679,7 +685,7 @@ def index():
 
             # MR activity via log freshness (cheap + reliable)
             mr_v1_age = _file_age_secs(LOG_MR_V1)
-            mr_v2_age = _file_age_secs(LOG_MR_V2)
+            mr_v2_age = (_file_age_secs(LOG_MR_V2) if LOG_MR_V2 else None)
             mr_v1_level = _bot_level(mr_v1_age)
             mr_v2_level = _bot_level(mr_v2_age)
 

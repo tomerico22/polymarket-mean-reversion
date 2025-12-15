@@ -1,19 +1,40 @@
 #!/bin/bash
 set -euo pipefail
 
-# DB connection (same as v1)
+# Mean Reversion Executor v2 Startup Script
+
+# DB connection (must be set in environment or systemd EnvironmentFile)
 export DB_URL="${DB_URL}"
 
 # Use v2 strategy
 export MR_STRATEGY="mean_reversion_v2"
 
-# Core MR parameters (same as your local script)
+# ------------------------------------------------------------
+# Your requested bands
+# Entry price band: 0.05 - 0.20
+# Dislocation band (px vs avg): -0.40 to -0.20
+#
+# NOTE: your executor enforces:
+#   dislo = (px-avg)/avg
+#   requires dislo < 0
+#   and DISLOCATION_THRESHOLD <= abs(dislo) <= MAX_DISLOCATION
+# So -0.40..-0.20 maps to:
+#   MR_DISLOCATION_THRESHOLD=0.20
+#   MR_MAX_DISLOCATION=0.40
+# ------------------------------------------------------------
+
+# Dislocation band
 export MR_DISLOCATION_THRESHOLD="${MR_DISLOCATION_THRESHOLD:-0.20}"
-export MR_MAX_DISLOCATION="${MR_MAX_DISLOCATION:-0.45}"
+export MR_MAX_DISLOCATION="${MR_MAX_DISLOCATION:-0.40}"
+
+# Entry price band (bounds are checked on raw px, before slippage)
 export MR_MIN_PRICE="${MR_MIN_PRICE:-0.05}"
-export MR_MAX_PRICE="${MR_MAX_PRICE:-0.95}"
+export MR_MAX_PRICE="${MR_MAX_PRICE:-0.20}"
+
+# Rolling average window (your executor currently hardcodes 18 hours in SQL)
 export MR_AVG_WINDOW_HOURS="${MR_AVG_WINDOW_HOURS:-18}"
 
+# Exits
 export MR_TAKE_PROFIT_PCT="${MR_TAKE_PROFIT_PCT:-0.15}"
 export MR_STOP_LOSS_PCT="${MR_STOP_LOSS_PCT:-0.15}"
 export MR_MAX_HOLD_HOURS="${MR_MAX_HOLD_HOURS:-12}"
@@ -38,14 +59,14 @@ export MR_MIN_VOLUME_24H="${MR_MIN_VOLUME_24H:-5000}"
 export MR_SLIPPAGE="${MR_SLIPPAGE:-0.01}"
 export MR_LOOP_SLEEP="${MR_LOOP_SLEEP:-10}"
 
-# V2-specific filters
-export MR2_MAX_ENTRY_PX="${MR2_MAX_ENTRY_PX:-0.15}"
-export MR2_MIN_DISLOCATION="${MR2_MIN_DISLOCATION:--0.45}"
+# V2-specific filters (only applied if your executor code supports MR2_*)
+# If supported, keep these aligned with your intent:
+export MR2_MAX_ENTRY_PX="${MR2_MAX_ENTRY_PX:-0.20}"
+export MR2_MIN_DISLOCATION="${MR2_MIN_DISLOCATION:--0.40}"
 export MR2_EXCLUDED_TAGS="${MR2_EXCLUDED_TAGS:-Neg Risk,Tweet Markets,Ethereum,Solana,elections,global elections,world elections,politics,Geopolitics,geopolitics,Pre-Market,Recurring,Almanak}"
 export MR2_MARKET_MAX_LOSS_USD="${MR2_MARKET_MAX_LOSS_USD:-75}"
 
-# NOTE: keyword blacklist now comes from mr/config/keyword_blacklist.txt
-# MR_EXCLUDE_KEYWORDS env is only a fallback if the file is missing
+# Keyword blacklist
 export MR_EXCLUDE_KEYWORDS="${MR_EXCLUDE_KEYWORDS:-}"
 
 export PYTHONUNBUFFERED=1
@@ -53,7 +74,8 @@ export PYTHONUNBUFFERED=1
 echo "=========================================="
 echo "Mean Reversion Executor v2 (Paper)"
 echo "Strategy: $MR_STRATEGY"
-echo "Entry caps: dislo >= ${MR_DISLOCATION_THRESHOLD}, max abs dislo ${MR_MAX_DISLOCATION}, max entry px ${MR2_MAX_ENTRY_PX}"
+echo "Entry px band: ${MR_MIN_PRICE} - ${MR_MAX_PRICE} (raw px, before slippage)"
+echo "Dislocation band: -${MR_MAX_DISLOCATION} to -${MR_DISLOCATION_THRESHOLD}"
 echo "Exits: TP ${MR_TAKE_PROFIT_PCT}, SL ${MR_STOP_LOSS_PCT}, hard cap ${MR_MAX_STOP_LOSS_PCT}, max hold ${MR_MAX_HOLD_HOURS}h"
 echo "Universe: top ${MR_TOP_MARKETS} markets, min vol \$${MR_MIN_VOLUME_24H}"
 echo "V2 tag blacklist: ${MR2_EXCLUDED_TAGS}"
@@ -61,9 +83,11 @@ echo "Per-market PnL cap: -\$${MR2_MARKET_MAX_LOSS_USD}"
 echo "=========================================="
 echo ""
 
-python3 -c "import psycopg" 2>/dev/null || {
-    echo "ERROR: psycopg not installed. Run: pip install psycopg[binary]"
+PY="/root/polymarket-mean-reversion/.venv/bin/python"
+
+"$PY" -c "import psycopg" 2>/dev/null || {
+    echo "ERROR: psycopg not installed in venv. Run: pip install psycopg[binary]"
     exit 1
 }
 
-python3 mr/mean_reversion_executor.py
+"$PY" mr/mean_reversion_executor.py

@@ -8,6 +8,10 @@ export DB_URL="${DB_URL}"
 # Strategy name
 export MR_STRATEGY="mean_reversion_v1"
 
+# fix stale
+export MR_PRICE_STALE_SECS="10800"
+export MR_STALE_BAN_SECS="10800"
+
 # Entry filters (VALIDATED from backtest)
 export MR_DISLOCATION_THRESHOLD="0.20"     # 20% below 18h avg
 export MR_MAX_DISLOCATION="0.45"           # Cap extreme dislocations at 45%
@@ -35,7 +39,7 @@ export MR_MAX_STOP_LOSS_PCT="${MR_MAX_STOP_LOSS_PCT:-0.20}"
 export MR_MAX_LOSS_STREAK="${MR_MAX_LOSS_STREAK:-4}"
 
 # Market selection
-export MR_TOP_MARKETS="${MR_TOP_MARKETS:-500}"                 # Top 500 by volume (wider universe)
+export MR_TOP_MARKETS="${MR_TOP_MARKETS:-1000}"                 # Top 1000 by volume (wider universe)
 export MR_MIN_VOLUME_24H="${MR_MIN_VOLUME_24H:-5000}"          # Min $5k 24h volume (looser)
 
 # Execution
@@ -69,10 +73,12 @@ echo "=========================================="
 echo ""
 
 # Check dependencies
-python3 -c "import psycopg" 2>/dev/null || {
+PY="/root/polymarket-mean-reversion/.venv/bin/python"
+
+"$PY" -c "import psycopg" 2>/dev/null || {
     echo "ERROR: psycopg not installed. Run: pip install psycopg[binary]"
     exit 1
 }
 
 # Run the executor
-python3 mr/mean_reversion_executor.py
+"$PY" mr/mean_reversion_executor.py

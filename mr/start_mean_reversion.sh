@@ -106,4 +106,4 @@ PY="/root/polymarket-mean-reversion/.venv/bin/python"
   exit 1
 }
 
-exec "$PY" mr/mean_reversion_executor.py
+exec flock -n /tmp/mr_v1.lock "$PY" mr/mean_reversion_executor.py

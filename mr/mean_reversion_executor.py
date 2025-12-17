@@ -11,10 +11,13 @@ from psycopg.rows import dict_row
 """
 Mean Reversion Executor (Paper)
 - Longs only
+- Daily stop (realized PnL, entries only)
+- Loss streak ban (per market+outcome, persisted)
 - Peak-to-trough market drawdown (realized + unrealized, mark-to-market)
 - Stale prices -> cooldown ban
 - Drawdown -> permanent ban + forced liquidation
 - Batch price snapshot (single query per loop)
+- Batch avg price (single query per loop, reduces DB load massively)
 - Entry dedup + position limits + time-based exits
 - Entry COUNT caching to reduce DB load
 """
@@ -33,6 +36,9 @@ LOG_PREFIX = "[MRS]"
 # Position sizing
 BASE_POSITION_USD = Decimal(os.getenv("MR_BASE_POSITION_USD", "100"))
 
+# Daily loss circuit breaker (realized PnL, entries only). 0 disables.
+DAILY_LOSS_LIMIT = Decimal(os.getenv("MR_DAILY_LOSS_LIMIT", "0"))
+
 # Risk - market drawdown (peak-to-trough)
 MR_MARKET_DD_FRACTION = Decimal(os.getenv("MR_MARKET_DD_FRACTION", "0.75"))  # fraction of BASE_POSITION_USD
 SLIPPAGE = Decimal(os.getenv("MR_SLIPPAGE", "0.01"))
@@ -40,6 +46,42 @@ SLIPPAGE = Decimal(os.getenv("MR_SLIPPAGE", "0.01"))
 # Price bounds
 MIN_PRICE = Decimal(os.getenv("MR_MIN_PRICE", "0"))
 MAX_PRICE = Decimal(os.getenv("MR_MAX_PRICE", "1"))
+
+# Loss streak ban (per market+outcome, consecutive realized losses)
+MAX_LOSS_STREAK = int(os.getenv("MR_MAX_LOSS_STREAK", "4"))
+
+# Strategy thresholds
+DISLOCATION_THRESHOLD = Decimal(os.getenv("MR_DISLOCATION_THRESHOLD", "0.20"))
+MAX_DISLOCATION = Decimal(os.getenv("MR_MAX_DISLOCATION", "0.45"))
+
+# Average window (hours) for mean reversion baseline
+AVG_WINDOW_HOURS = int(os.getenv("MR_AVG_WINDOW_HOURS", "18"))
+
+# Exits
+TAKE_PROFIT_PCT = Decimal(os.getenv("MR_TAKE_PROFIT_PCT", "0.15"))
+STOP_LOSS_PCT = Decimal(os.getenv("MR_STOP_LOSS_PCT", "0.15"))
+MAX_STOP_LOSS_PCT = Decimal(os.getenv("MR_MAX_STOP_LOSS_PCT", "0.20"))  # hard cap / worst-case fallback
+MAX_HOLD_HOURS = int(os.getenv("MR_MAX_HOLD_HOURS", "12"))
+
+# Limits
+MAX_OPEN_POSITIONS = int(os.getenv("MR_MAX_OPEN_POSITIONS", "10"))
+MAX_POSITIONS_PER_MARKET = int(os.getenv("MR_MAX_POSITIONS_PER_MARKET", "1"))
+
+# Market selection
+TOP_MARKETS = int(os.getenv("MR_TOP_MARKETS", "50"))
+MIN_VOLUME_24H = Decimal(os.getenv("MR_MIN_VOLUME_24H", "10000"))
+MIN_VOLUME_1H = Decimal(os.getenv("MR_MIN_VOLUME_1H", "0"))  # 0 disables
+
+# Excluded tags (optional, requires markets.tags column)
+_tags_env = os.getenv("MR_EXCLUDED_TAGS") or os.getenv("MR_EXCLUDE_TAGS") or "sports,nfl,nba,soccer,mlb,hockey"
+EXCLUDED_TAGS = {t.strip().lower() for t in _tags_env.split(",") if t.strip()}
+
+# Price staleness
+MR_PRICE_STALE_SECS = int(os.getenv("MR_PRICE_STALE_SECS", "300"))
+MR_STALE_BAN_SECS = int(os.getenv("MR_STALE_BAN_SECS", "900"))
+
+# Loop
+LOOP_SLEEP = int(os.getenv("MR_LOOP_SLEEP", "10"))
 
 # ----------------------------
 # Keyword blacklist (question-based)
@@ -53,8 +95,43 @@ REQUIRE_QUESTION = os.getenv("MR_REQUIRE_QUESTION", "0").strip() == "1"
 _kw_file_mtime = None
 _kw_file_list = []
 
+
+# =========================
+# HELPERS
+# =========================
+
+def to_dec(val, default=None):
+    try:
+        if val is None:
+            return default
+        return Decimal(str(val))
+    except (InvalidOperation, TypeError):
+        return default
+
+
+def norm_market_id(market_id):
+    if market_id is None:
+        raise ValueError("market_id cannot be None")
+    mid = str(market_id).strip()
+    if not mid:
+        raise ValueError("market_id cannot be empty")
+    return mid
+
+
+def get_conn():
+    conn = connect(DB_URL, row_factory=dict_row)
+    conn.autocommit = True
+    conn.prepare_threshold = None
+    return conn
+
+
+def utc_day_start(ts: datetime) -> datetime:
+    return ts.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 def _kw_norm(s: str) -> str:
     return " ".join(str(s).lower().strip().split())
+
 
 def _load_keyword_blacklist():
     global _kw_file_mtime, _kw_file_list
@@ -82,6 +159,7 @@ def _load_keyword_blacklist():
 
     return sorted(set([x for x in (_kw_file_list + env_list) if x]))
 
+
 def is_question_blocked(question: str) -> bool:
     q = _kw_norm(question or "")
     if REQUIRE_QUESTION and not q:
@@ -90,6 +168,7 @@ def is_question_blocked(question: str) -> bool:
         if kw and kw in q:
             return True
     return False
+
 
 def first_blocking_keyword(question: str) -> str:
     q = _kw_norm(question or "")
@@ -100,60 +179,6 @@ def first_blocking_keyword(question: str) -> str:
             return kw
     return ""
 
-# Strategy thresholds
-DISLOCATION_THRESHOLD = Decimal(os.getenv("MR_DISLOCATION_THRESHOLD", "0.20"))
-MAX_DISLOCATION = Decimal(os.getenv("MR_MAX_DISLOCATION", "0.45"))
-
-# Exits
-TAKE_PROFIT_PCT = Decimal(os.getenv("MR_TAKE_PROFIT_PCT", "0.15"))
-STOP_LOSS_PCT = Decimal(os.getenv("MR_STOP_LOSS_PCT", "0.15"))
-MAX_STOP_LOSS_PCT = Decimal(os.getenv("MR_MAX_STOP_LOSS_PCT", "0.20"))  # hard cap / worst-case fallback
-MAX_HOLD_HOURS = int(os.getenv("MR_MAX_HOLD_HOURS", "12"))
-
-# Limits
-MAX_OPEN_POSITIONS = int(os.getenv("MR_MAX_OPEN_POSITIONS", "10"))
-MAX_POSITIONS_PER_MARKET = int(os.getenv("MR_MAX_POSITIONS_PER_MARKET", "1"))
-
-# Market selection
-TOP_MARKETS = int(os.getenv("MR_TOP_MARKETS", "50"))
-MIN_VOLUME_24H = Decimal(os.getenv("MR_MIN_VOLUME_24H", "10000"))
-
-# Excluded tags (optional, requires markets.tags column)
-_tags_env = os.getenv("MR_EXCLUDED_TAGS") or os.getenv("MR_EXCLUDE_TAGS") or "sports,nfl,nba,soccer,mlb,hockey"
-EXCLUDED_TAGS = {t.strip().lower() for t in _tags_env.split(",") if t.strip()}
-
-# Price staleness
-MR_PRICE_STALE_SECS = int(os.getenv("MR_PRICE_STALE_SECS", "300"))
-MR_STALE_BAN_SECS = int(os.getenv("MR_STALE_BAN_SECS", "900"))
-
-# Loop
-LOOP_SLEEP = int(os.getenv("MR_LOOP_SLEEP", "10"))
-
-# =========================
-# HELPERS
-# =========================
-
-def to_dec(val, default=None):
-    try:
-        if val is None:
-            return default
-        return Decimal(str(val))
-    except (InvalidOperation, TypeError):
-        return default
-
-def norm_market_id(market_id):
-    if market_id is None:
-        raise ValueError("market_id cannot be None")
-    mid = str(market_id).strip()
-    if not mid:
-        raise ValueError("market_id cannot be empty")
-    return mid
-
-def get_conn():
-    conn = connect(DB_URL, row_factory=dict_row)
-    conn.autocommit = True
-    conn.prepare_threshold = None
-    return conn
 
 # =========================
 # TABLES
@@ -186,6 +211,11 @@ def ensure_tables(cur):
     """)
 
     cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_mr_positions_exit_ts
+    ON mr_positions(strategy, status, exit_ts);
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS mr_market_risk_state (
         strategy TEXT NOT NULL,
         market_id TEXT NOT NULL,
@@ -204,6 +234,93 @@ def ensure_tables(cur):
     ON mr_market_risk_state(strategy, banned, banned_until)
     WHERE banned = true;
     """)
+
+    # Loss streak state (persisted)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS mr_loss_streak_state (
+        strategy TEXT NOT NULL,
+        market_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        loss_streak INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (strategy, market_id, outcome)
+    );
+    """)
+
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_mr_loss_streak_state
+    ON mr_loss_streak_state(strategy, market_id, outcome, loss_streak);
+    """)
+
+
+# =========================
+# DAILY STOP (realized PnL)
+# =========================
+
+def get_realized_pnl_since(cur, start_ts: datetime) -> Decimal:
+    cur.execute("""
+        SELECT COALESCE(SUM(pnl), 0) AS pnl
+        FROM mr_positions
+        WHERE strategy = %s
+          AND status = 'closed'
+          AND exit_ts >= %s
+    """, (STRATEGY, start_ts))
+    row = cur.fetchone() or {}
+    return Decimal(str(row.get("pnl") or 0))
+
+
+def daily_stop_triggered(cur, now_ts: datetime) -> bool:
+    if DAILY_LOSS_LIMIT <= 0:
+        return False
+    pnl_today = get_realized_pnl_since(cur, utc_day_start(now_ts))
+    return pnl_today <= -DAILY_LOSS_LIMIT
+
+
+# =========================
+# LOSS STREAK STATE
+# =========================
+
+def get_loss_streak(cur, market_id: str, outcome: str) -> int:
+    mid = norm_market_id(market_id)
+    out = str(outcome).strip()
+    cur.execute("""
+        SELECT loss_streak
+        FROM mr_loss_streak_state
+        WHERE strategy=%s AND market_id=%s AND outcome=%s
+    """, (STRATEGY, mid, out))
+    row = cur.fetchone()
+    return int(row["loss_streak"]) if row else 0
+
+
+def set_loss_streak(cur, market_id: str, outcome: str, streak: int):
+    mid = norm_market_id(market_id)
+    out = str(outcome).strip()
+    cur.execute("""
+        INSERT INTO mr_loss_streak_state(strategy, market_id, outcome, loss_streak)
+        VALUES (%s,%s,%s,%s)
+        ON CONFLICT (strategy, market_id, outcome)
+        DO UPDATE SET loss_streak=EXCLUDED.loss_streak, updated_at=NOW()
+    """, (STRATEGY, mid, out, int(streak)))
+
+
+def update_loss_streak_on_close(cur, market_id: str, outcome: str, pnl: Decimal):
+    """
+    Consecutive realized losses:
+    - pnl < 0: increment
+    - pnl >= 0: reset to 0
+    """
+    mid = norm_market_id(market_id)
+    out = str(outcome).strip()
+    prev = get_loss_streak(cur, mid, out)
+    if pnl < 0:
+        new = prev + 1
+        set_loss_streak(cur, mid, out, new)
+        if new >= MAX_LOSS_STREAK:
+            print(f"{LOG_PREFIX} LOSS_STREAK hit {mid[:16]} {out} streak={new} (blocking new entries)")
+    else:
+        if prev != 0:
+            set_loss_streak(cur, mid, out, 0)
+
 
 # =========================
 # PRICE SNAPSHOT CACHE
@@ -245,11 +362,14 @@ def refresh_price_snapshot(cur, pairs):
             r["ts"],
         )
 
+
 def get_last_price_cached(market_id, outcome):
     return PRICE_SNAPSHOT.get((norm_market_id(market_id), str(outcome).strip()))
 
+
 def is_price_stale(px_ts, now_ts):
     return (now_ts - px_ts).total_seconds() > MR_PRICE_STALE_SECS
+
 
 def market_has_stale_price(market_id, now_ts):
     """
@@ -265,6 +385,53 @@ def market_has_stale_price(market_id, now_ts):
         if is_price_stale(ts, now_ts):
             return True
     return False
+
+
+# =========================
+# BATCH AVG CACHE
+# =========================
+
+AVG_SNAPSHOT = {}  # (market_id, outcome) -> avg_price (Decimal)
+
+def refresh_avg_snapshot(cur, pairs, now_ts: datetime):
+    """
+    Batch-load avg prices for (market_id, outcome) pairs into AVG_SNAPSHOT.
+    One query, huge DB-load reduction compared to per-pair AVG().
+    """
+    global AVG_SNAPSHOT
+    AVG_SNAPSHOT = {}
+
+    pairs = list({(norm_market_id(m), str(o).strip()) for m, o in pairs if m is not None and o is not None})
+    if not pairs:
+        return
+
+    market_ids = [m for m, _ in pairs]
+    outcomes = [o for _, o in pairs]
+
+    cur.execute("""
+        WITH pairs(market_id, outcome) AS (
+            SELECT * FROM UNNEST(%s::text[], %s::text[]) AS t(market_id, outcome)
+        )
+        SELECT
+            rt.market_id,
+            rt.outcome,
+            AVG(rt.price) AS avg_price
+        FROM raw_trades rt
+        JOIN pairs p
+          ON rt.market_id = p.market_id
+         AND rt.outcome = p.outcome
+        WHERE rt.ts >= %s - make_interval(hours => %s)
+          AND rt.ts < %s
+        GROUP BY rt.market_id, rt.outcome
+    """, (market_ids, outcomes, now_ts, AVG_WINDOW_HOURS, now_ts))
+
+    for r in (cur.fetchall() or []):
+        AVG_SNAPSHOT[(norm_market_id(r["market_id"]), str(r["outcome"]).strip())] = Decimal(str(r["avg_price"]))
+
+
+def get_avg_cached(market_id, outcome):
+    return AVG_SNAPSHOT.get((norm_market_id(market_id), str(outcome).strip()))
+
 
 # =========================
 # MARKET TAG FILTER (optional)
@@ -298,6 +465,7 @@ def is_market_excluded_by_tags(cur, market_id):
     except Exception:
         return False
 
+
 # =========================
 # MARKET RISK STATE
 # =========================
@@ -309,6 +477,7 @@ def load_market_state(cur, market_id):
         WHERE strategy = %s AND market_id = %s
     """, (STRATEGY, mid))
     return cur.fetchone()
+
 
 def upsert_market_state(cur, market_id, **fields):
     mid = norm_market_id(market_id)
@@ -324,6 +493,7 @@ def upsert_market_state(cur, market_id, **fields):
         DO UPDATE SET {sets}, updated_at = NOW()
     """, [STRATEGY, mid] + vals)
 
+
 def normalize_ban_state(cur, market_id, now_ts):
     row = load_market_state(cur, market_id)
     if row and row["banned"] and row["banned_until"]:
@@ -336,10 +506,11 @@ def normalize_ban_state(cur, market_id, now_ts):
                 banned_reason=None,
             )
 
+
 def ban_market(cur, market_id, now_ts, reason, permanent=True):
     mid = norm_market_id(market_id)
 
-    # Step 2: idempotent ban (avoid repeated re-bans / log spam)
+    # Idempotent ban (avoid repeated re-bans / log spam)
     try:
         row = load_market_state(cur, mid)
         if row and row.get("banned"):
@@ -362,16 +533,15 @@ def ban_market(cur, market_id, now_ts, reason, permanent=True):
         banned_reason=reason,
     )
 
-    print(
-        f"{LOG_PREFIX} MARKET BANNED {mid[:16]} "
-        f"reason={reason} permanent={permanent}"
-    )
+    print(f"{LOG_PREFIX} MARKET BANNED {mid[:16]} reason={reason} permanent={permanent}")
+
 
 def is_market_banned(cur, market_id, now_ts):
     mid = norm_market_id(market_id)
     normalize_ban_state(cur, mid, now_ts)
     row = load_market_state(cur, mid)
     return bool(row and row["banned"])
+
 
 # =========================
 # EQUITY / DRAW DOWN
@@ -417,6 +587,7 @@ def compute_market_equity(cur, market_id, now_ts):
 
     return realized + unreal
 
+
 def update_market_dd_state(cur, market_id, now_ts):
     """
     If (peak_equity - equity) >= limit, permanently ban the market.
@@ -432,15 +603,11 @@ def update_market_dd_state(cur, market_id, now_ts):
     limit = (BASE_POSITION_USD * MR_MARKET_DD_FRACTION)
     dd = peak - equity
 
-    upsert_market_state(
-        cur,
-        mid,
-        peak_equity=peak,
-        last_equity=equity,
-    )
+    upsert_market_state(cur, mid, peak_equity=peak, last_equity=equity)
 
     if dd >= limit:
         ban_market(cur, mid, now_ts, "drawdown", permanent=True)
+
 
 # =========================
 # FORCE CLOSE PERMA-KILLED MARKETS
@@ -486,10 +653,10 @@ def force_close_killed_markets(cur, now_ts):
             WHERE id=%s
         """, (exit_px, now_ts, pnl, p["id"]))
 
-        print(
-            f"{LOG_PREFIX} FORCE EXIT #{p['id']} "
-            f"{market_id[:16]} pnl=${float(pnl):.2f}"
-        )
+        update_loss_streak_on_close(cur, market_id, str(p["outcome"]).strip(), pnl)
+
+        print(f"{LOG_PREFIX} FORCE EXIT #{p['id']} {market_id[:16]} pnl=${float(pnl):.2f}")
+
 
 # =========================
 # MARKET SELECTION
@@ -497,12 +664,12 @@ def force_close_killed_markets(cur, now_ts):
 
 def get_top_markets(cur, now_ts):
     """
-    Top markets by 24h volume.
+    Top markets by 24h volume with optional 1h minimum volume filter.
     Requires BOTH outcomes (0/1) to be present AND fresh.
     Uses COALESCE(value_usd, price*qty, 0) to be robust to schema differences.
     """
     cur.execute("""
-        WITH per_outcome AS (
+        WITH per_outcome_24h AS (
             SELECT
                 rt.market_id,
                 rt.outcome,
@@ -514,26 +681,43 @@ def get_top_markets(cur, now_ts):
               AND rt.outcome IN ('0','1')
             GROUP BY rt.market_id, rt.outcome
         ),
+        per_outcome_1h AS (
+            SELECT
+                rt.market_id,
+                rt.outcome,
+                SUM(COALESCE(rt.value_usd, rt.price * rt.qty, 0)) AS vol_1h
+            FROM raw_trades rt
+            WHERE rt.ts >= %s - INTERVAL '1 hour'
+              AND rt.ts < %s
+              AND rt.outcome IN ('0','1')
+            GROUP BY rt.market_id, rt.outcome
+        ),
         per_market AS (
             SELECT
-                market_id,
-                SUM(vol_24h) AS volume_24h,
-                MIN(last_ts) AS min_last_ts,
-                COUNT(DISTINCT outcome) AS outcomes_seen
-            FROM per_outcome
-            GROUP BY market_id
+                p24.market_id,
+                SUM(p24.vol_24h) AS volume_24h,
+                SUM(COALESCE(p1.vol_1h, 0)) AS volume_1h,
+                MIN(p24.last_ts) AS min_last_ts,
+                COUNT(DISTINCT p24.outcome) AS outcomes_seen
+            FROM per_outcome_24h p24
+            LEFT JOIN per_outcome_1h p1
+              ON p1.market_id = p24.market_id
+             AND p1.outcome = p24.outcome
+            GROUP BY p24.market_id
         )
         SELECT
             market_id,
             volume_24h,
+            volume_1h,
             min_last_ts AS last_trade_ts
         FROM per_market
         WHERE volume_24h >= %s
           AND outcomes_seen = 2
           AND min_last_ts >= %s - make_interval(secs => %s)
+          AND (%s::numeric <= 0 OR volume_1h >= %s)
         ORDER BY volume_24h DESC
         LIMIT %s
-    """, (now_ts, now_ts, MIN_VOLUME_24H, now_ts, MR_PRICE_STALE_SECS, TOP_MARKETS))
+    """, (now_ts, now_ts, now_ts, now_ts, MIN_VOLUME_24H, now_ts, MR_PRICE_STALE_SECS, MIN_VOLUME_1H, MIN_VOLUME_1H, TOP_MARKETS))
 
     markets = [norm_market_id(r["market_id"]) for r in (cur.fetchall() or [])]
     filtered = []
@@ -563,6 +747,7 @@ def get_top_markets(cur, now_ts):
     print(f"{LOG_PREFIX} TOP_MARKETS raw={len(markets)} after_filters={len(filtered)}")
     return filtered
 
+
 # =========================
 # ENTRY LOGIC (COUNT CACHED)
 # =========================
@@ -570,16 +755,21 @@ def get_top_markets(cur, now_ts):
 def scan_and_open(cur, markets, now_ts):
     """
     COUNT-cached entry scanning:
+    - daily stop gate (entries only)
+    - loss streak ban per market+outcome
     - 1 query for global open count
     - 1 query for (market_id, outcome) open counts
-    Then update local cache on each insert.
-
-    Also:
-    - Filters banned markets early
-    - Cooldown bans stale markets early (market-level)
+    - batch avg snapshot for all scan pairs (1 query)
     """
     counters = defaultdict(int)
     entries = 0
+
+    # Daily stop gate
+    if daily_stop_triggered(cur, now_ts):
+        counters["daily_stop"] += 1
+        print(f"{LOG_PREFIX} DAILY_STOP hit: blocking entries for today (limit=${float(DAILY_LOSS_LIMIT):.2f})")
+        print(f"{LOG_PREFIX} SCAN_SUMMARY markets_in={len(markets)} active=0 tradable=0 entries=0 daily_stop=1")
+        return
 
     # Cache global count once
     cur.execute("""
@@ -622,6 +812,13 @@ def scan_and_open(cur, markets, now_ts):
             continue
         tradable_markets.append(mid)
 
+    # Batch avg snapshot for all tradable (market,outcome) pairs
+    avg_pairs = []
+    for mid in tradable_markets:
+        avg_pairs.append((mid, "0"))
+        avg_pairs.append((mid, "1"))
+    refresh_avg_snapshot(cur, avg_pairs, now_ts)
+
     for mid in tradable_markets:
         if global_count >= MAX_OPEN_POSITIONS:
             counters["cap_global_midloop"] += 1
@@ -636,6 +833,12 @@ def scan_and_open(cur, markets, now_ts):
             if global_count >= MAX_OPEN_POSITIONS:
                 counters["cap_global_outcome"] += 1
                 break
+
+            # Loss streak ban (per market+outcome)
+            streak = get_loss_streak(cur, mid, outcome)
+            if MAX_LOSS_STREAK > 0 and streak >= MAX_LOSS_STREAK:
+                counters["loss_streak"] += 1
+                continue
 
             # Per market/outcome cap + dedup
             if pos_counts[(mid, outcome)] >= MAX_POSITIONS_PER_MARKET:
@@ -658,17 +861,8 @@ def scan_and_open(cur, markets, now_ts):
                 counters["px_oob"] += 1
                 continue
 
-            # 18h average aligned to now_ts
-            cur.execute("""
-                SELECT AVG(price) AS avg_price
-                FROM raw_trades
-                WHERE market_id=%s AND outcome=%s
-                  AND ts >= %s - INTERVAL '18 hours'
-                  AND ts < %s
-            """, (mid, outcome, now_ts, now_ts))
-
-            row = cur.fetchone() or {}
-            avg = to_dec(row.get("avg_price"), None)
+            # Use batch avg
+            avg = get_avg_cached(mid, outcome)
             if avg is None or avg <= 0:
                 counters["avg_missing"] += 1
                 continue
@@ -699,10 +893,7 @@ def scan_and_open(cur, markets, now_ts):
             pos_counts[(mid, outcome)] += 1
             entries += 1
 
-            print(
-                f"{LOG_PREFIX} ENTRY {mid[:16]} {outcome} "
-                f"px={float(entry_px):.4f} dislo={float(dislo)*100:.1f}%"
-            )
+            print(f"{LOG_PREFIX} ENTRY {mid[:16]} {outcome} px={float(entry_px):.4f} dislo={float(dislo)*100:.1f}%")
 
     # Print scan summary once per loop
     parts = [f"{k}={v}" for k, v in sorted(counters.items())]
@@ -712,11 +903,12 @@ def scan_and_open(cur, markets, now_ts):
         f"entries={entries} " + " ".join(parts)
     )
 
+
 # =========================
 # EXIT LOGIC
 # =========================
 
-def close_position(cur, pos_id, exit_px, now_ts, reason, pnl):
+def close_position(cur, pos_id, market_id, outcome, exit_px, now_ts, reason, pnl):
     cur.execute("""
         UPDATE mr_positions
         SET status='closed',
@@ -726,6 +918,10 @@ def close_position(cur, pos_id, exit_px, now_ts, reason, pnl):
             pnl=%s
         WHERE id=%s
     """, (exit_px, now_ts, reason, pnl, pos_id))
+
+    # Update loss streak state (persisted)
+    update_loss_streak_on_close(cur, market_id, outcome, pnl)
+
 
 def process_exits(cur, now_ts):
     """
@@ -761,7 +957,7 @@ def process_exits(cur, now_ts):
         # Hard max stop loss based on realized price
         if realized_pnl_pct <= -MAX_STOP_LOSS_PCT:
             pnl = (exit_px - entry) * size
-            close_position(cur, p["id"], exit_px, now_ts, "max_sl", pnl)
+            close_position(cur, p["id"], market_id, outcome, exit_px, now_ts, "max_sl", pnl)
             print(f"{LOG_PREFIX} EXIT max_sl #{p['id']} pnl=${float(pnl):.2f}")
             continue
 
@@ -769,28 +965,29 @@ def process_exits(cur, now_ts):
         elapsed_hours = (now_ts - entry_ts).total_seconds() / 3600
         if elapsed_hours >= MAX_HOLD_HOURS:
             pnl = (exit_px - entry) * size
-            close_position(cur, p["id"], exit_px, now_ts, "time", pnl)
+            close_position(cur, p["id"], market_id, outcome, exit_px, now_ts, "time", pnl)
             print(f"{LOG_PREFIX} EXIT time #{p['id']} pnl=${float(pnl):.2f}")
             continue
 
         # TP/SL exits
         if pnl_pct_mid >= TAKE_PROFIT_PCT:
             pnl = (exit_px - entry) * size
-            close_position(cur, p["id"], exit_px, now_ts, "tp", pnl)
+            close_position(cur, p["id"], market_id, outcome, exit_px, now_ts, "tp", pnl)
             print(f"{LOG_PREFIX} EXIT tp #{p['id']} pnl=${float(pnl):.2f}")
             continue
 
         if pnl_pct_mid <= -STOP_LOSS_PCT:
             pnl = (exit_px - entry) * size
-            close_position(cur, p["id"], exit_px, now_ts, "sl", pnl)
+            close_position(cur, p["id"], market_id, outcome, exit_px, now_ts, "sl", pnl)
             print(f"{LOG_PREFIX} EXIT sl #{p['id']} pnl=${float(pnl):.2f}")
             continue
+
 
 # =========================
 # STATUS
 # =========================
 
-def print_status(cur):
+def print_status(cur, now_ts: datetime):
     cur.execute("""
         SELECT
             COUNT(*) FILTER (WHERE status='open') AS open_count,
@@ -806,7 +1003,15 @@ def print_status(cur):
     winners = int(r.get("winners") or 0)
     total_pnl = float(r.get("total_pnl") or 0)
     wr = (100.0 * winners / closed_count) if closed_count > 0 else 0.0
-    print(f"{LOG_PREFIX} STATUS open={open_count} closed={closed_count} WR={wr:.1f}% pnl=${total_pnl:.2f}")
+
+    pnl_today = 0.0
+    try:
+        pnl_today = float(get_realized_pnl_since(cur, utc_day_start(now_ts)))
+    except Exception:
+        pnl_today = 0.0
+
+    print(f"{LOG_PREFIX} STATUS open={open_count} closed={closed_count} WR={wr:.1f}% pnl=${total_pnl:.2f} pnl_today=${pnl_today:.2f}")
+
 
 # =========================
 # MAIN LOOP
@@ -860,12 +1065,12 @@ def main():
                 # 6) Exits (tp/sl/time/max_sl)
                 process_exits(cur, now_ts)
 
-                # 7) Force close again (defensive: catches perma-bans that happened during this loop's activity)
+                # 7) Force close again (defensive)
                 force_close_killed_markets(cur, now_ts)
 
                 # Status every 5 minutes
                 if (now_ts - last_status).total_seconds() >= 300:
-                    print_status(cur)
+                    print_status(cur, now_ts)
                     last_status = now_ts
 
             time.sleep(LOOP_SLEEP)
@@ -874,6 +1079,6 @@ def main():
             print(f"{LOG_PREFIX} ERROR {e}")
             time.sleep(30)
 
+
 if __name__ == "__main__":
     main()
-PY

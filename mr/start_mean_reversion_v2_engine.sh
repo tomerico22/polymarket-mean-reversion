@@ -7,6 +7,14 @@ export MR_STRATEGY="mean_reversion_v2"
 
 export MR_BASE_POSITION_USD="${MR_BASE_POSITION_USD:-100}"
 
+# Safety (shared with v1)
+export MR_DAILY_LOSS_LIMIT="${MR_DAILY_LOSS_LIMIT:-1000}"
+export MR_MAX_LOSS_STREAK="${MR_MAX_LOSS_STREAK:-4}"
+export MR_LOSS_STREAK_BAN_HOURS="${MR_LOSS_STREAK_BAN_HOURS:-12}"
+# 1h volume gate (0 disables)
+export MR_MIN_VOLUME_1H="${MR_MIN_VOLUME_1H:-500}"
+
+
 export MR_MARKET_DD_FRACTION="${MR_MARKET_DD_FRACTION:-0.75}"
 export MR_SLIPPAGE="${MR_SLIPPAGE:-0.01}"
 

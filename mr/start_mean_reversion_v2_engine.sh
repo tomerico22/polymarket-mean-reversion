@@ -43,4 +43,4 @@ export PYTHONUNBUFFERED=1
 PY="/root/polymarket-mean-reversion/.venv/bin/python"
 "$PY" -c "import psycopg" >/dev/null
 
-exec "$PY" mr/mean_reversion_executor.py
+exec flock -n /tmp/mr_v2.lock "$PY" mr/mean_reversion_executor.py

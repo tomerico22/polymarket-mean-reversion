@@ -12,8 +12,8 @@ export MR_STRATEGY="mean_reversion_v1"
 # ------------------------------------------------------------
 # Price staleness + cooldown ban
 # ------------------------------------------------------------
-export MR_PRICE_STALE_SECS="${MR_PRICE_STALE_SECS:-10800}"
-export MR_STALE_BAN_SECS="${MR_STALE_BAN_SECS:-10800}"
+export MR_PRICE_STALE_SECS="${MR_PRICE_STALE_SECS:-3600}"
+export MR_STALE_BAN_SECS="${MR_STALE_BAN_SECS:-3600}"
 
 # ------------------------------------------------------------
 # Entry filters (validated from backtest)

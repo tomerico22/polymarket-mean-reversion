@@ -89,6 +89,13 @@ RECENT_CLOSED_LIMIT = int(os.getenv("DASH_RECENT_CLOSED_LIMIT", "30"))
 BEST_WORST_MARKETS_LIMIT = int(os.getenv("DASH_BEST_WORST_MARKETS_LIMIT", "20"))
 KILLED_MARKETS_LIMIT = int(os.getenv("DASH_KILLED_MARKETS_LIMIT", "20"))
 
+# ------------------------------------------------------------
+# DB idle-in-transaction health (NEW)
+# ------------------------------------------------------------
+DASH_DB_IDLE_TX_WARN_SECS = int(os.getenv("DASH_DB_IDLE_TX_WARN_SECS", "300"))   # 5m
+DASH_DB_IDLE_TX_BAD_SECS = int(os.getenv("DASH_DB_IDLE_TX_BAD_SECS", "600"))     # 10m
+DASH_DB_IDLE_TX_BAD_COUNT = int(os.getenv("DASH_DB_IDLE_TX_BAD_COUNT", "2"))
+
 HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -207,6 +214,9 @@ HTML = r"""
       <strong>Status:</strong>
       DB:
       <span class="{% if cc.status.db_level == 'ok' %}pnl-pos{% elif cc.status.db_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.db_text }}</span>
+      |
+      DB TX:
+      <span class="{% if cc.status.db_tx_level == 'ok' %}pnl-pos{% elif cc.status.db_tx_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.db_tx_text }}</span>
       |
       Ingest:
       <span class="{% if cc.status.ingest_level == 'ok' %}pnl-pos{% elif cc.status.ingest_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.ingest_text }}</span>
@@ -444,6 +454,12 @@ HTML = r"""
         <span class="dot"></span>
         <span class="label">DB</span>
         <span class="value">{{ health.db.text }}</span>
+      </div>
+
+      <div class="pill {{ health.db_tx.status }}">
+        <span class="dot"></span>
+        <span class="label">DB TX</span>
+        <span class="value">{{ health.db_tx.text }}</span>
       </div>
 
       <div class="pill {{ health.ingest.status }}">
@@ -849,6 +865,24 @@ def _limits_for_mode(mode):
     }
 
 
+# ------------------------------------------------------------
+# DB idle-in-transaction probe (NEW)
+# ------------------------------------------------------------
+def _load_idle_in_transaction(cur):
+    r = _safe_fetchone(
+        cur,
+        """
+        SELECT
+          COUNT(*) FILTER (WHERE state = 'idle in transaction') AS cnt,
+          MAX(EXTRACT(EPOCH FROM (now() - xact_start)))
+            FILTER (WHERE state = 'idle in transaction') AS max_age
+        FROM pg_stat_activity
+        WHERE datname = current_database();
+        """,
+    )
+    return int(r.get("cnt") or 0), int(r.get("max_age") or 0)
+
+
 def _load_open_positions(cur, strategy, mode):
     tbl = _positions_table_for_mode(mode)
 
@@ -959,7 +993,6 @@ def _sharpe_from_pnls(pnls):
     sd = pstdev(pnls)
     if sd == 0:
         return None
-    # trade-level sharpe: mean/stdev * sqrt(n)
     return (mu / sd) * (len(pnls) ** 0.5)
 
 
@@ -1096,7 +1129,6 @@ def _merge_perf(a, b):
             continue
         largest_loss = v if largest_loss is None else min(largest_loss, v)
 
-    # sharpe can't be merged properly without raw series; return None
     sharpe = None
 
     return {
@@ -1111,11 +1143,12 @@ def _merge_perf(a, b):
 
 
 def _load_performance_snapshot(cur, strategy, mode):
-    # Today: exit_ts >= CURRENT_DATE
-    # Yesterday: CURRENT_DATE - 1 day <= exit_ts < CURRENT_DATE
     def one_mode_snap(m):
         ptoday = _load_perf_time_range(cur, strategy, m, "AND exit_ts >= CURRENT_DATE")
-        pyday = _load_perf_time_range(cur, strategy, m, "AND exit_ts >= (CURRENT_DATE - INTERVAL '1 day') AND exit_ts < CURRENT_DATE")
+        pyday = _load_perf_time_range(
+            cur, strategy, m,
+            "AND exit_ts >= (CURRENT_DATE - INTERVAL '1 day') AND exit_ts < CURRENT_DATE"
+        )
         p7 = _load_perf_window(cur, strategy, m, "7 days")
         pall = _load_perf_window(cur, strategy, m, None)
         return ptoday, pyday, p7, pall
@@ -1130,7 +1163,6 @@ def _load_performance_snapshot(cur, strategy, mode):
         p7 = _merge_perf(l7, p7x)
         pall = _merge_perf(la, pa)
 
-    # Use today for status if any trades today, else use yesterday, else use 7d
     ref = ptoday if (ptoday["trades"] or 0) > 0 else (pyday if (pyday["trades"] or 0) > 0 else p7)
 
     def status_from_perf():
@@ -1216,10 +1248,6 @@ def _load_recent_closed(cur, strategy, mode, limit_n):
 
 
 def _load_killed_markets(cur, strategy, mode, limit_n):
-    """
-    Last N kill exits, ordered by most recent exit_ts.
-    total_pnl = cumulative closed pnl for that market_id+outcome (same table, same strategy filter).
-    """
     tbl = _positions_table_for_mode(mode)
 
     sql = f"""
@@ -1459,6 +1487,7 @@ def index():
 
     health = {
         "db": {"status": "na", "text": "unknown"},
+        "db_tx": {"status": "na", "text": "na"},
         "ingest": {"status": "na", "text": "unknown"},
         "tmux": check_tmux_sessions(),
         "bots": {"status": "na", "text": "na"},
@@ -1497,11 +1526,24 @@ def index():
         "best_markets": [],
     }
 
+    idle_cnt = 0
+    idle_age = 0
+
     try:
         with get_conn() as conn, conn.cursor() as cur:
-            # DB ping
             _ = _safe_fetchone(cur, "SELECT 1 AS ok;")
             health["db"] = {"status": "ok", "text": "connected"}
+
+            # DB TX health (NEW)
+            idle_cnt, idle_age = _load_idle_in_transaction(cur)
+            if idle_cnt == 0:
+                health["db_tx"] = {"status": "ok", "text": "0"}
+            elif idle_cnt >= DASH_DB_IDLE_TX_BAD_COUNT or idle_age >= DASH_DB_IDLE_TX_BAD_SECS:
+                health["db_tx"] = {"status": "bad", "text": f"{idle_cnt} / {_fmt_age(idle_age)}"}
+            elif idle_age >= DASH_DB_IDLE_TX_WARN_SECS:
+                health["db_tx"] = {"status": "warn", "text": f"{idle_cnt} / {_fmt_age(idle_age)}"}
+            else:
+                health["db_tx"] = {"status": "warn", "text": str(idle_cnt)}
 
             # Ingest freshness
             r = _safe_fetchone(cur, "SELECT MAX(ts) AS max_ts FROM raw_trades;")
@@ -1574,7 +1616,6 @@ def index():
                     diag["recent_closed"] = _load_recent_closed(cur, strategy, mode, RECENT_CLOSED_LIMIT)
                     diag["killed_markets"] = _load_killed_markets(cur, strategy, mode, KILLED_MARKETS_LIMIT)
                 else:
-                    # best effort: show from live
                     diag["recent_closed"] = _load_recent_closed(cur, strategy, "live", RECENT_CLOSED_LIMIT)
                     diag["killed_markets"] = _load_killed_markets(cur, strategy, "live", KILLED_MARKETS_LIMIT)
 
@@ -1653,6 +1694,8 @@ def index():
                 cc["status"] = {
                     "db_level": "ok",
                     "db_text": "OK",
+                    "db_tx_level": health["db_tx"]["status"],
+                    "db_tx_text": health["db_tx"]["text"],
                     "ingest_level": ingest_level,
                     "ingest_text": "no trades" if ingest_lag is None else f"{int(ingest_lag)}s",
                     "tmux_level": health["tmux"]["status"],
@@ -1771,10 +1814,8 @@ def index():
                     "system_level": system_level,
                 }
 
-                # performance snapshot (Today / Yesterday / 7d / All)
                 cc["perf"] = _load_performance_snapshot(cur, strategy, mode)
 
-                # Filter performance: parse log + trades executed today
                 fp = _filters_today_from_log(strategy)
 
                 executed_today = 0
@@ -1812,7 +1853,6 @@ def index():
                     "blocked": fp["blocked"],
                 }
 
-                # Problems
                 problems = []
                 for op in open_positions:
                     entry = Decimal(str(op.get("entry_price") or 0))
@@ -1842,7 +1882,6 @@ def index():
                     })
                 cc["problems"] = sorted(problems, key=lambda x: (x["unreal"], -x["age_h"]))[:10]
 
-                # Market intel (live only - schema known)
                 if mode == "live":
                     rows = _safe_fetchall(
                         cur,
@@ -1890,6 +1929,7 @@ def index():
 
     except Exception as e:
         health["db"] = {"status": "bad", "text": "FAILED"}
+        health["db_tx"] = {"status": "na", "text": "na"}
         health["ingest"] = {"status": "na", "text": "unknown"}
         health["bots"] = {"status": "na", "text": "na"}
         page_error = str(e)

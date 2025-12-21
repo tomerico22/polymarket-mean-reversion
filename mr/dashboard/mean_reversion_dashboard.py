@@ -677,7 +677,7 @@ def index():
             if not latest_flow_ts:
                 latest_flow_ts = _db_latest_ts(
                     cur,
-                    "SELECT MAX(ts) AS ts FROM strategy_orders WHERE strategy = %s;",
+                    "SELECT MAX(created_at) AS ts FROM strategy_orders WHERE strategy = %s;",
                     ("sm_smartflow_v1",),
                 )
             smartflow_age = _age_from_ts(latest_flow_ts)

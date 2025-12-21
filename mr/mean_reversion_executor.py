@@ -83,6 +83,10 @@ MR_STALE_BAN_SECS = int(os.getenv("MR_STALE_BAN_SECS", "900"))
 # Loop
 LOOP_SLEEP = int(os.getenv("MR_LOOP_SLEEP", "10"))
 
+#Intents
+MR_INTENTS_ENABLE = os.getenv("MR_INTENTS_ENABLE", "0").strip() == "1"
+MR_INTENTS_ONLY   = os.getenv("MR_INTENTS_ONLY", "0").strip() == "1"
+
 # ----------------------------
 # Keyword blacklist (question-based)
 # ----------------------------
@@ -179,6 +183,27 @@ def first_blocking_keyword(question: str) -> str:
             return kw
     return ""
 
+def emit_trade_intent(cur, now_ts, market_id, outcome, entry_px, size_usd, avg=None, dislo=None, note=None):
+    cur.execute("""
+        INSERT INTO mr_trade_intents (
+            strategy, market_id, outcome, side,
+            entry_price, size_usd, dislocation, avg_price_18h,
+            source, note, status, status_ts
+        )
+        VALUES (%s,%s,%s,'long',%s,%s,%s,%s,'paper',%s,'new',%s)
+        ON CONFLICT (strategy, market_id, outcome, side, entry_price)
+        DO NOTHING
+    """, (
+        STRATEGY,
+        norm_market_id(market_id),
+        str(outcome).strip(),
+        entry_px,
+        Decimal(str(size_usd)),
+        dislo,
+        avg,
+        note,
+        now_ts,
+    ))
 
 # =========================
 # TABLES
@@ -756,10 +781,12 @@ def scan_and_open(cur, markets, now_ts):
     """
     COUNT-cached entry scanning:
     - daily stop gate (entries only)
-    - loss streak ban per market+outcome
+    - loss streak ban (per market+outcome, persisted)
     - 1 query for global open count
     - 1 query for (market_id, outcome) open counts
     - batch avg snapshot for all scan pairs (1 query)
+    - optional intent writer (mr_trade_intents)
+    - optional intent-only mode (no mr_positions inserts)
     """
     counters = defaultdict(int)
     entries = 0
@@ -881,8 +908,37 @@ def scan_and_open(cur, markets, now_ts):
                 continue
 
             entry_px = px * (Decimal("1") + SLIPPAGE)
-            size = BASE_POSITION_USD / entry_px
 
+            # Keep sizing semantics: BASE_POSITION_USD means "USD per trade"
+            size_usd = BASE_POSITION_USD
+            size = size_usd / entry_px
+
+            # 1) Emit intent (optional)
+            if MR_INTENTS_ENABLE:
+                try:
+                    emit_trade_intent(
+                        cur,
+                        now_ts,
+                        mid,
+                        outcome,
+                        entry_px,
+                        size_usd=size_usd,
+                        avg=avg,
+                        dislo=dislo,
+                        note=f"dislo={float(dislo)*100:.1f}% px={float(entry_px):.4f}"
+                    )
+                    counters["intent_emitted"] += 1
+                    print(f"{LOG_PREFIX} INTENT {mid[:16]} {outcome} px={float(entry_px):.4f} usd={float(size_usd):.2f} dislo={float(dislo)*100:.1f}%")
+                except Exception as e:
+                    counters["intent_error"] += 1
+                    print(f"{LOG_PREFIX} INTENT_ERROR {mid[:16]} {outcome} err={e}")
+
+            # 2) Intent-only mode: do not open paper positions
+            if MR_INTENTS_ONLY:
+                counters["intent_only_skip_pos"] += 1
+                continue
+
+            # 3) Normal behavior: open mr_positions row
             cur.execute("""
                 INSERT INTO mr_positions (strategy, market_id, outcome, side, entry_price, entry_ts, size, avg_price_18h, dislocation)
                 VALUES (%s,%s,%s,'long',%s,%s,%s,%s,%s)

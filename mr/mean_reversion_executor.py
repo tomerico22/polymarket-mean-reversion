@@ -83,9 +83,13 @@ MR_STALE_BAN_SECS = int(os.getenv("MR_STALE_BAN_SECS", "900"))
 # Loop
 LOOP_SLEEP = int(os.getenv("MR_LOOP_SLEEP", "10"))
 
-#Intents
+# Intents
 MR_INTENTS_ENABLE = os.getenv("MR_INTENTS_ENABLE", "0").strip() == "1"
 MR_INTENTS_ONLY   = os.getenv("MR_INTENTS_ONLY", "0").strip() == "1"
+
+INTENT_SOURCE = (os.getenv("MR_INTENT_SOURCE", "paper").strip() or "paper").lower()
+if INTENT_SOURCE not in ("paper", "mr1"):
+    raise SystemExit(f"Bad MR_INTENT_SOURCE={INTENT_SOURCE} (allowed: paper, mr1)")
 
 # ----------------------------
 # Keyword blacklist (question-based)
@@ -190,7 +194,7 @@ def emit_trade_intent(cur, now_ts, market_id, outcome, entry_px, size_usd, avg=N
             entry_price, size_usd, dislocation, avg_price_18h,
             source, note, status, status_ts
         )
-        VALUES (%s,%s,%s,'long',%s,%s,%s,%s,'paper',%s,'new',%s)
+        VALUES (%s,%s,%s,'long',%s,%s,%s,%s,%s,%s,'new',%s)
         ON CONFLICT (strategy, market_id, outcome, side, entry_price)
         DO NOTHING
     """, (
@@ -201,6 +205,7 @@ def emit_trade_intent(cur, now_ts, market_id, outcome, entry_px, size_usd, avg=N
         Decimal(str(size_usd)),
         dislo,
         avg,
+        INTENT_SOURCE,   # <-- was hardcoded 'paper'
         note,
         now_ts,
     ))

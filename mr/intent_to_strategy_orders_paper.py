@@ -15,7 +15,11 @@ EXEC_STRATEGY = os.getenv("MR_STRATEGY", "mean_reversion_v1")
 POLL_SECS = float(os.getenv("MR_INTENT_POLL_SECS", "2.0"))
 BATCH = int(os.getenv("MR_INTENT_BATCH", "25"))
 
-# Safety: default to paper always in this worker
+# Which intent "source" values should this paper worker consume?
+# Default stays "paper" for safety. You can set MR_INTENT_SOURCE=mr1 for shadow mode.
+INTENT_SOURCE = (os.getenv("MR_INTENT_SOURCE", "paper").strip() or "paper").lower()
+
+# Safety: this worker always writes paper=true to strategy_orders
 PAPER = True
 
 
@@ -29,7 +33,7 @@ def dec(x) -> Decimal:
 def main():
     print(
         f"[intent2orders] started strategy={EXEC_STRATEGY} "
-        f"paper={PAPER} poll={POLL_SECS}s batch={BATCH}"
+        f"paper={PAPER} source={INTENT_SOURCE} poll={POLL_SECS}s batch={BATCH}"
     )
 
     with psycopg.connect(DB_URL, row_factory=dict_row) as conn:
@@ -42,14 +46,16 @@ def main():
                     WITH picked AS (
                       SELECT id, created_ts, market_id, outcome, entry_price, size_usd, dislocation
                       FROM mr_trade_intents
-                      WHERE source = 'paper' AND status IN ('new','queued') AND order_id IS NULL
+                      WHERE source = %s
+                        AND status IN ('new','queued')
+                        AND order_id IS NULL
                       ORDER BY id ASC
                       LIMIT %s
                       FOR UPDATE SKIP LOCKED
                     )
                     SELECT * FROM picked;
                     """,
-                    (BATCH,),
+                    (INTENT_SOURCE, BATCH),
                 )
                 intents = cur.fetchall()
 
@@ -93,6 +99,7 @@ def main():
                         "dislocation": str(dislo) if dislo is not None else None,
                         "entry_price": str(limit_px),
                         "size_usd": str(size_usd),
+                        "intent_source": INTENT_SOURCE,
                     }
 
                     cur.execute(

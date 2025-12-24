@@ -18,6 +18,26 @@ app = Flask(__name__)
 
 REFRESH_SECS = 30
 
+
+def _tail_text(p: Path, max_bytes: int = 2_000_000) -> str:
+    """
+    Read only the tail of a potentially large file to avoid blocking the dashboard.
+    Returns up to max_bytes from the end (best-effort).
+    """
+    try:
+        if not p or not p.exists():
+            return ""
+        with p.open("rb") as f:
+            try:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes), 0)
+            except Exception:
+                f.seek(0)
+            b = f.read()
+        return b.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
 # ----------------------------
 # Health thresholds (seconds)
 # ----------------------------
@@ -90,10 +110,10 @@ BEST_WORST_MARKETS_LIMIT = int(os.getenv("DASH_BEST_WORST_MARKETS_LIMIT", "20"))
 KILLED_MARKETS_LIMIT = int(os.getenv("DASH_KILLED_MARKETS_LIMIT", "20"))
 
 # ------------------------------------------------------------
-# DB idle-in-transaction health (NEW)
+# DB idle-in-transaction health
 # ------------------------------------------------------------
-DASH_DB_IDLE_TX_WARN_SECS = int(os.getenv("DASH_DB_IDLE_TX_WARN_SECS", "300"))   # 5m
-DASH_DB_IDLE_TX_BAD_SECS = int(os.getenv("DASH_DB_IDLE_TX_BAD_SECS", "600"))     # 10m
+DASH_DB_IDLE_TX_WARN_SECS = int(os.getenv("DASH_DB_IDLE_TX_WARN_SECS", "300"))  # 5m
+DASH_DB_IDLE_TX_BAD_SECS = int(os.getenv("DASH_DB_IDLE_TX_BAD_SECS", "600"))  # 10m
 DASH_DB_IDLE_TX_BAD_COUNT = int(os.getenv("DASH_DB_IDLE_TX_BAD_COUNT", "2"))
 
 HTML = r"""
@@ -102,104 +122,328 @@ HTML = r"""
 <head>
   <meta charset="utf-8">
   <title>Mean Reversion Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="{{ refresh_secs }}">
   <style>
-    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; background:#111; color:#eee; }
-    h1 { font-size: 1.6rem; margin: 0.2rem 0; }
-    h2 { font-size: 1.15rem; margin: 1.1rem 0 0.4rem 0; }
-    h3 { font-size: 0.95rem; margin: 0.8rem 0 0.35rem 0; color:#ddd; }
-    .small { font-size:0.75rem; color:#aaa; }
-    .muted { color:#999; }
-
-    .toolbar { margin:0.6rem 0 0.8rem 0; display:flex; gap:1rem; align-items:center; flex-wrap:wrap; }
-    .toolbar label { margin-right:0.4rem; }
-    select { background:#1d1d1d; color:#eee; border:1px solid #333; border-radius:10px; padding:0.35rem 0.55rem; }
-
-    a.tab { background:#1d1d1d; color:#eee; border:1px solid #333; border-radius:10px; padding:0.35rem 0.55rem; text-decoration:none; }
-    a.tab.active { border-color:#32cd32; }
-
-    .healthbar { display:flex; gap:0.6rem; flex-wrap:wrap; margin:0.8rem 0 1rem 0; }
-    .pill { display:flex; align-items:center; gap:0.5rem; padding:0.35rem 0.6rem; border-radius:999px; border:1px solid #333; background:#1a1a1a; }
-    .dot { width:10px; height:10px; border-radius:50%; background:#666; }
-    .pill .label { font-size:0.72rem; color:#bbb; text-transform:uppercase; letter-spacing:0.02em; }
-    .pill .value { font-size:0.8rem; color:#eee; }
-    .ok .dot { background:#32cd32; }
-    .warn .dot { background:#ffd24d; }
-    .bad .dot { background:#ff4d4d; }
-    .na .dot { background:#666; }
-    .pill.bad { border-color:#4a2020; }
-    .pill.warn { border-color:#4a3b20; }
-    .pill.ok { border-color:#244a24; }
-    .pill.na { border-color:#333; }
-
-    .summary { display:flex; gap:1rem; flex-wrap:wrap; margin:0.8rem 0 0.8rem 0; }
-    .card { background:#1d1d1d; padding:0.8rem 1rem; border-radius:10px; min-width:10rem; border:1px solid #2a2a2a; }
-    .card-label { font-size:0.7rem; text-transform:uppercase; color:#aaa; margin-bottom:0.25rem; letter-spacing:0.02em; }
-    .card-value { font-size:1.1rem; font-weight:700; }
-
-    .pnl-pos { color:#32cd32; font-weight:700; }
-    .pnl-neg { color:#ff4d4d; font-weight:700; }
-    .warn-txt { color:#ffd24d; font-weight:700; }
-
-    table { border-collapse:collapse; width:100%; margin-top:0.5rem; font-size:0.82rem; }
-    th, td { border:1px solid #333; padding:0.35rem 0.55rem; text-align:left; vertical-align:top; }
-    th { background:#222; position:sticky; top:0; }
-    tr:nth-child(even) { background:#181818; }
-    tr:nth-child(odd) { background:#151515; }
-
-    .strip { background:#151515; border:1px solid #2a2a2a; border-radius:10px; padding:0.6rem 0.75rem; margin:0.6rem 0; }
-
-    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:1rem; }
-    @media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
-
-    .errorbox { margin-top: 1rem; padding: 0.8rem 1rem; background:#1d1d1d; border:1px solid #4a2020; border-radius:10px; color:#ffb3b3; }
-
+    :root{
+      --bg:#0f1115;
+      --panel:#151924;
+      --panel2:#121621;
+      --border:#2a3142;
+      --text:#e9edf5;
+      --muted:#aab2c5;
+      --muted2:#8089a3;
+      --ok:#2ecc71;
+      --warn:#f1c40f;
+      --bad:#ff4d4d;
+      --link:#9db7ff;
+      --shadow: 0 10px 25px rgba(0,0,0,.30);
+      --r:14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      margin: 18px;
+      background: var(--bg);
+      color: var(--text);
+    }
+    a { color: var(--link); }
+    h1 { font-size: 1.35rem; margin: 0.2rem 0; letter-spacing: 0.01em; }
+    h2 { font-size: 1.05rem; margin: 1.1rem 0 0.45rem 0; color: #dfe6ff; }
+    h3 { font-size: 0.92rem; margin: 0.9rem 0 0.35rem 0; color: #cfd6ef; }
+    .small { font-size: 0.78rem; color: var(--muted); }
+    .muted { color: var(--muted2); }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
+    .topbar {
+      position: sticky;
+      top: 10px;
+      z-index: 50;
+      padding: 10px 12px;
+      background: rgba(15,17,21,0.75);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(42,49,66,0.6);
+      border-radius: var(--r);
+      box-shadow: var(--shadow);
+      margin-bottom: 12px;
+    }
+    .row { display:flex; gap: 12px; align-items:center; flex-wrap: wrap; }
+    .grow { flex: 1 1 auto; }
+    .tabs { display:flex; gap: 10px; flex-wrap: wrap; align-items:center; }
+    .tab {
+      background: var(--panel2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 7px 10px;
+      text-decoration: none;
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .tab.active { border-color: rgba(46,204,113,0.65); box-shadow: 0 0 0 3px rgba(46,204,113,0.10); }
+    .tab .kbd { font-size: 0.70rem; color: var(--muted); border:1px solid var(--border); padding: 2px 6px; border-radius: 8px; background: rgba(255,255,255,0.03); }
+
+    .toolbar {
+      display:flex; gap: 10px; align-items: center; flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    label { color: var(--muted); font-size: 0.78rem; }
+    select, input[type="text"]{
+      background: var(--panel2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px 10px;
+      outline: none;
+    }
+    input[type="text"]{ min-width: 240px; }
+    .btn {
+      background: rgba(157,183,255,0.10);
+      border: 1px solid rgba(157,183,255,0.35);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 8px 10px;
+      cursor: pointer;
+    }
+    .btn:hover { background: rgba(157,183,255,0.16); }
+
+    .healthbar { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+    .pill {
+      display:flex; align-items:center; gap: 10px;
+      padding: 9px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background:#666; }
+    .pill .label { font-size: 0.70rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .pill .value { font-size: 0.80rem; color: var(--text); }
+    .ok .dot { background: var(--ok); }
+    .warn .dot { background: var(--warn); }
+    .bad .dot { background: var(--bad); }
+    .na .dot { background: #666; }
+    .pill.ok { box-shadow: 0 0 0 3px rgba(46,204,113,0.10); }
+    .pill.warn { box-shadow: 0 0 0 3px rgba(241,196,15,0.10); }
+    .pill.bad { box-shadow: 0 0 0 3px rgba(255,77,77,0.10); }
+
+    .grid { display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+    @media (max-width: 1200px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    @media (max-width: 750px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 10px 12px;
+      box-shadow: var(--shadow);
+      min-height: 74px;
+    }
+    .card-label { font-size: 0.70rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+    .card-value { font-size: 1.05rem; font-weight: 750; }
+    .pnl-pos { color: var(--ok); font-weight: 750; }
+    .pnl-neg { color: var(--bad); font-weight: 750; }
+    .warn-txt { color: var(--warn); font-weight: 750; }
+
+    details.section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      box-shadow: var(--shadow);
+      margin: 12px 0;
+      overflow: hidden;
+    }
+    details.section > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 10px 12px;
+      display:flex;
+      gap: 10px;
+      align-items: center;
+      border-bottom: 1px solid rgba(42,49,66,0.65);
+      user-select: none;
+    }
+    details.section > summary::-webkit-details-marker { display:none; }
+    .sumtitle { font-weight: 750; }
+    .sumhint { font-size: 0.78rem; color: var(--muted); }
+    .content { padding: 10px 12px 12px 12px; }
+
+    table { border-collapse: separate; border-spacing: 0; width: 100%; margin-top: 8px; font-size: 0.82rem; }
+    th, td { border-bottom: 1px solid rgba(42,49,66,0.65); padding: 8px 8px; text-align: left; vertical-align: middle; }
+    th {
+      color: #dfe6ff;
+      font-weight: 700;
+      position: sticky;
+      top: 5px;                 /* was 70px */
+      background: rgba(21,25,36,0.98);
+      z-index: 5;
+    }
+    tr:hover td { background: rgba(157,183,255,0.06); }
+    .nowrap { white-space: nowrap; }
+    .right { text-align: right; }
+    .chip {
+      display:inline-flex; gap: 8px; align-items:center;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(42,49,66,0.85);
+      background: rgba(0,0,0,0.12);
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+    .copy {
+      border: 1px solid rgba(42,49,66,0.9);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      padding: 2px 7px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 0.74rem;
+    }
+    .copy:hover { background: rgba(255,255,255,0.07); }
+
+    .errorbox {
+      margin-top: 12px;
+      padding: 10px 12px;
+      background: rgba(255,77,77,0.08);
+      border: 1px solid rgba(255,77,77,0.35);
+      border-radius: var(--r);
+      color: #ffb3b3;
+      box-shadow: var(--shadow);
+    }
+    .subtools { display:flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+    .hint { font-size: 0.78rem; color: var(--muted); }
+
+    .kpirow { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+    .kpi { padding: 6px 10px; border: 1px solid rgba(42,49,66,0.85); background: rgba(0,0,0,0.12); border-radius: 999px; font-size: 0.78rem; color: var(--muted); }
   </style>
   <script>
     const refreshSecs = {{ refresh_secs }};
     let remaining = refreshSecs;
+
     function tick() {
       const el = document.getElementById("refresh_left");
       if (el) el.textContent = remaining;
       remaining = remaining > 0 ? remaining - 1 : 0;
     }
+
+    function copyText(txt){
+      try {
+        navigator.clipboard.writeText(txt);
+      } catch(e) {}
+    }
+
+    function wireCopyButtons(){
+      document.querySelectorAll("[data-copy]").forEach(btn => {
+        btn.addEventListener("click", () => copyText(btn.getAttribute("data-copy") || ""));
+      });
+    }
+
+    function filterTable(tableId, query){
+      const q = (query || "").toLowerCase().trim();
+      const t = document.getElementById(tableId);
+      if (!t) return;
+      const rows = t.querySelectorAll("tbody tr");
+      rows.forEach(r => {
+        const txt = r.innerText.toLowerCase();
+        r.style.display = (q === "" || txt.includes(q)) ? "" : "none";
+      });
+    }
+
     document.addEventListener("DOMContentLoaded", () => {
       tick();
       setInterval(tick, 1000);
+      wireCopyButtons();
+
+      const globalFilter = document.getElementById("global_filter");
+      if (globalFilter) {
+        globalFilter.addEventListener("input", () => {
+          const q = globalFilter.value;
+          document.querySelectorAll("table[data-filterable='1']").forEach(tbl => {
+            filterTable(tbl.id, q);
+          });
+        });
+      }
     });
   </script>
 </head>
 <body>
-  <h1>Mean Reversion Dashboard</h1>
 
-  <div class="small">
-    DB: {{ db_url_short }} - Updated at {{ now_utc }} - Strategy: <strong>{{ strategy }}</strong> - Mode: <strong>{{ mode }}</strong> -
-    Refresh every {{ refresh_secs }}s (in <span id="refresh_left">{{ refresh_secs }}</span>s)
-  </div>
+  <div class="topbar">
+    <div class="row">
+      <div class="grow">
+        <h1>Mean Reversion Dashboard</h1>
+        <div class="small">
+          DB: {{ db_url_short }} - Updated: {{ now_utc }}
+          - Strategy: <strong>{{ strategy }}</strong>
+          - Mode: <strong>{{ mode }}</strong>
+          - Refresh: {{ refresh_secs }}s (in <span id="refresh_left">{{ refresh_secs }}</span>s)
+        </div>
+      </div>
 
-  <div class="toolbar">
-    <div>
-      <a class="tab {% if view == 'command' %}active{% endif %}" href="/?view=command&strategy={{ strategy }}&mode={{ mode }}">Command Center</a>
-      <a class="tab {% if view != 'command' %}active{% endif %}" href="/?view=diagnostics&strategy={{ strategy }}&mode={{ mode }}">Diagnostics</a>
+      <div class="tabs">
+        <a class="tab {% if view == 'command' %}active{% endif %}" href="/?view=command&strategy={{ strategy }}&mode={{ mode }}">
+          Command <span class="kbd">K</span>
+        </a>
+        <a class="tab {% if view != 'command' %}active{% endif %}" href="/?view=diagnostics&strategy={{ strategy }}&mode={{ mode }}">
+          Diagnostics <span class="kbd">D</span>
+        </a>
+      </div>
     </div>
 
-    <form method="get">
-      <input type="hidden" name="view" value="{{ view }}">
-      <label for="strategy" class="small">Strategy:</label>
-      <select id="strategy" name="strategy" onchange="this.form.submit()">
-        {% for s in strategies %}
-          <option value="{{ s }}" {% if s == strategy %}selected{% endif %}>{{ s }}</option>
-        {% endfor %}
-      </select>
+    <div class="toolbar">
+      <form method="get" class="row">
+        <input type="hidden" name="view" value="{{ view }}">
 
-      <label for="mode" class="small">Mode:</label>
-      <select id="mode" name="mode" onchange="this.form.submit()">
-        {% for m in modes %}
-          <option value="{{ m }}" {% if m == mode %}selected{% endif %}>{{ m }}</option>
-        {% endfor %}
-      </select>
-    </form>
+        <label for="strategy">Strategy</label>
+        <select id="strategy" name="strategy" onchange="this.form.submit()">
+          {% for s in strategies %}
+            <option value="{{ s }}" {% if s == strategy %}selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+
+        <label for="mode">Mode</label>
+        <select id="mode" name="mode" onchange="this.form.submit()">
+          {% for m in modes %}
+            <option value="{{ m }}" {% if m == mode %}selected{% endif %}>{{ m }}</option>
+          {% endfor %}
+        </select>
+
+        <label for="global_filter">Filter tables</label>
+        <input id="global_filter" type="text" placeholder="type to filter rows (client-side)">
+      </form>
+    </div>
+
+    <div class="healthbar">
+      <div class="pill {{ health.db.status }}">
+        <span class="dot"></span>
+        <span class="label">DB</span>
+        <span class="value">{{ health.db.text }}</span>
+      </div>
+      <div class="pill {{ health.db_tx.status }}">
+        <span class="dot"></span>
+        <span class="label">DB TX</span>
+        <span class="value">{{ health.db_tx.text }}</span>
+      </div>
+      <div class="pill {{ health.ingest.status }}">
+        <span class="dot"></span>
+        <span class="label">Ingest</span>
+        <span class="value">{{ health.ingest.text }}</span>
+      </div>
+      <div class="pill {{ health.tmux.status }}">
+        <span class="dot"></span>
+        <span class="label">tmux</span>
+        <span class="value">{{ health.tmux.text }}</span>
+      </div>
+      <div class="pill {{ health.bots.status }}">
+        <span class="dot"></span>
+        <span class="label">Bots</span>
+        <span class="value">{{ health.bots.text }}</span>
+      </div>
+      <div class="pill {{ health.dashboard.status }}">
+        <span class="dot"></span>
+        <span class="label">Dash</span>
+        <span class="value">{{ health.dashboard.text }}</span>
+      </div>
+    </div>
   </div>
 
   {% if page_error %}
@@ -210,307 +454,318 @@ HTML = r"""
 
   {% if view == 'command' %}
 
-    <div class="strip">
-      <strong>Status:</strong>
-      DB:
-      <span class="{% if cc.status.db_level == 'ok' %}pnl-pos{% elif cc.status.db_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.db_text }}</span>
-      |
-      DB TX:
-      <span class="{% if cc.status.db_tx_level == 'ok' %}pnl-pos{% elif cc.status.db_tx_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.db_tx_text }}</span>
-      |
-      Ingest:
-      <span class="{% if cc.status.ingest_level == 'ok' %}pnl-pos{% elif cc.status.ingest_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.ingest_text }}</span>
-      |
-      tmux:
-      <span class="{% if cc.status.tmux_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.status.tmux_text }}</span>
-      |
-      Bots:
-      <span class="{% if cc.status.bots_level == 'ok' %}pnl-pos{% elif cc.status.bots_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.bots_text }}</span>
-      |
-      Last entry: <span class="muted">{{ cc.status.last_entry_text }}</span>
-      |
-      Last exit: <span class="muted">{{ cc.status.last_exit_text }}</span>
+    <div class="grid">
+      <div class="card">
+        <div class="card-label">System</div>
+        <div class="card-value {% if cc.kill.system_level == 'ok' %}pnl-pos{% elif cc.kill.system_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">
+          {{ cc.kill.system_level|upper }}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Daily PnL</div>
+        <div class="card-value {% if cc.kill.daily_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
+          {{ "%.2f"|format(cc.kill.daily_pnl) }}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Worst Open</div>
+        <div class="card-value {% if cc.kill.worst_open < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
+          {{ "%.2f"|format(cc.kill.worst_open) }}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Loss Streak</div>
+        <div class="card-value {% if cc.kill.loss_streak_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">
+          {{ cc.kill.loss_streak }}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">WR (24h)</div>
+        <div class="card-value {% if cc.kill.winrate_level == 'ok' %}pnl-pos{% elif cc.kill.winrate_level == 'warn' %}warn-txt{% else %}muted{% endif %}">
+          {% if cc.kill.winrate_24h is none %}na{% else %}{{ "%.1f"|format(cc.kill.winrate_24h * 100) }}%{% endif %}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Bots</div>
+        <div class="card-value {% if cc.status.bots_level == 'ok' %}pnl-pos{% elif cc.status.bots_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">
+          {{ cc.status.bots_text }}
+        </div>
+      </div>
     </div>
 
-    <h2>Performance Snapshot</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Metric</th>
-          <th>Today</th>
-          <th>Yesterday</th>
-          <th>Last 7d</th>
-          <th>All time</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>Total PnL</td>
-          <td class="{% if cc.perf.pnls.ptoday < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.perf.pnls.ptoday) }}</td>
-          <td class="{% if cc.perf.pnls.pyday < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.perf.pnls.pyday) }}</td>
-          <td class="{% if cc.perf.pnls.p7 < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.perf.pnls.p7) }}</td>
-          <td class="{% if cc.perf.pnls.pall < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.perf.pnls.pall) }}</td>
-          <td class="{{ cc.perf.status.pnl_class }}">{{ cc.perf.status.pnl_text }}</td>
-        </tr>
-        <tr>
-          <td>Trades</td>
-          <td>{{ cc.perf.trades.ttoday }}</td>
-          <td>{{ cc.perf.trades.tyday }}</td>
-          <td>{{ cc.perf.trades.t7 }}</td>
-          <td>{{ cc.perf.trades.tall }}</td>
-          <td class="muted">-</td>
-        </tr>
-        <tr>
-          <td>Win rate</td>
-          <td>{{ "%.1f"|format(cc.perf.winrate.wtoday * 100) if cc.perf.winrate.wtoday is not none else "na" }}%</td>
-          <td>{{ "%.1f"|format(cc.perf.winrate.wyday * 100) if cc.perf.winrate.wyday is not none else "na" }}%</td>
-          <td>{{ "%.1f"|format(cc.perf.winrate.w7 * 100) if cc.perf.winrate.w7 is not none else "na" }}%</td>
-          <td>{{ "%.1f"|format(cc.perf.winrate.wall * 100) if cc.perf.winrate.wall is not none else "na" }}%</td>
-          <td class="{{ cc.perf.status.wr_class }}">{{ cc.perf.status.wr_text }}</td>
-        </tr>
-        <tr>
-          <td>Avg PnL / trade</td>
-          <td>{{ "%.2f"|format(cc.perf.avgpnl.atoday) if cc.perf.avgpnl.atoday is not none else "na" }}</td>
-          <td>{{ "%.2f"|format(cc.perf.avgpnl.ayday) if cc.perf.avgpnl.ayday is not none else "na" }}</td>
-          <td>{{ "%.2f"|format(cc.perf.avgpnl.a7) if cc.perf.avgpnl.a7 is not none else "na" }}</td>
-          <td>{{ "%.2f"|format(cc.perf.avgpnl.aall) if cc.perf.avgpnl.aall is not none else "na" }}</td>
-          <td class="muted">-</td>
-        </tr>
-        <tr>
-          <td>Max SL rate</td>
-          <td>{{ "%.1f"|format(cc.perf.slrate.stoday * 100) if cc.perf.slrate.stoday is not none else "na" }}%</td>
-          <td>{{ "%.1f"|format(cc.perf.slrate.syday * 100) if cc.perf.slrate.syday is not none else "na" }}%</td>
-          <td>{{ "%.1f"|format(cc.perf.slrate.s7 * 100) if cc.perf.slrate.s7 is not none else "na" }}%</td>
-          <td>{{ "%.1f"|format(cc.perf.slrate.sall * 100) if cc.perf.slrate.sall is not none else "na" }}%</td>
-          <td class="{{ cc.perf.status.sl_class }}">{{ cc.perf.status.sl_text }}</td>
-        </tr>
-        <tr>
-          <td>Largest loss</td>
-          <td class="pnl-neg">{{ "%.2f"|format(cc.perf.largestloss.ltoday) if cc.perf.largestloss.ltoday is not none else "na" }}</td>
-          <td class="pnl-neg">{{ "%.2f"|format(cc.perf.largestloss.lyday) if cc.perf.largestloss.lyday is not none else "na" }}</td>
-          <td class="pnl-neg">{{ "%.2f"|format(cc.perf.largestloss.l7) if cc.perf.largestloss.l7 is not none else "na" }}</td>
-          <td class="pnl-neg">{{ "%.2f"|format(cc.perf.largestloss.lall) if cc.perf.largestloss.lall is not none else "na" }}</td>
-          <td class="muted">-</td>
-        </tr>
-        <tr>
-          <td>Sharpe (trade-level)</td>
-          <td>{{ "%.2f"|format(cc.perf.sharpe.shtoday) if cc.perf.sharpe.shtoday is not none else "na" }}</td>
-          <td>{{ "%.2f"|format(cc.perf.sharpe.shyday) if cc.perf.sharpe.shyday is not none else "na" }}</td>
-          <td>{{ "%.2f"|format(cc.perf.sharpe.sh7) if cc.perf.sharpe.sh7 is not none else "na" }}</td>
-          <td>{{ "%.2f"|format(cc.perf.sharpe.shall) if cc.perf.sharpe.shall is not none else "na" }}</td>
-          <td class="{{ cc.perf.status.sh_class }}">{{ cc.perf.status.sh_text }}</td>
-        </tr>
-      </tbody>
-    </table>
+    <details class="section" open>
+      <summary>
+        <span class="sumtitle">Performance Snapshot</span>
+        <span class="sumhint">today / yesterday / 7d / all</span>
+      </summary>
+      <div class="content">
+        <table id="tbl_perf" data-filterable="1">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th class="right">Today</th>
+              <th class="right">Yesterday</th>
+              <th class="right">Last 7d</th>
+              <th class="right">All time</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Total PnL</td>
+              <td class="right {% if cc.perf.pnls.ptoday < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.perf.pnls.ptoday) }}</td>
+              <td class="right {% if cc.perf.pnls.pyday < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.perf.pnls.pyday) }}</td>
+              <td class="right {% if cc.perf.pnls.p7 < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.perf.pnls.p7) }}</td>
+              <td class="right {% if cc.perf.pnls.pall < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.perf.pnls.pall) }}</td>
+              <td class="{{ cc.perf.status.pnl_class }}">{{ cc.perf.status.pnl_text }}</td>
+            </tr>
+            <tr>
+              <td>Trades</td>
+              <td class="right">{{ cc.perf.trades.ttoday }}</td>
+              <td class="right">{{ cc.perf.trades.tyday }}</td>
+              <td class="right">{{ cc.perf.trades.t7 }}</td>
+              <td class="right">{{ cc.perf.trades.tall }}</td>
+              <td class="muted">-</td>
+            </tr>
+            <tr>
+              <td>Win rate</td>
+              <td class="right">{{ "%.1f"|format(cc.perf.winrate.wtoday * 100) if cc.perf.winrate.wtoday is not none else "na" }}%</td>
+              <td class="right">{{ "%.1f"|format(cc.perf.winrate.wyday * 100) if cc.perf.winrate.wyday is not none else "na" }}%</td>
+              <td class="right">{{ "%.1f"|format(cc.perf.winrate.w7 * 100) if cc.perf.winrate.w7 is not none else "na" }}%</td>
+              <td class="right">{{ "%.1f"|format(cc.perf.winrate.wall * 100) if cc.perf.winrate.wall is not none else "na" }}%</td>
+              <td class="{{ cc.perf.status.wr_class }}">{{ cc.perf.status.wr_text }}</td>
+            </tr>
+            <tr>
+              <td>Avg PnL / trade</td>
+              <td class="right">{{ "%.2f"|format(cc.perf.avgpnl.atoday) if cc.perf.avgpnl.atoday is not none else "na" }}</td>
+              <td class="right">{{ "%.2f"|format(cc.perf.avgpnl.ayday) if cc.perf.avgpnl.ayday is not none else "na" }}</td>
+              <td class="right">{{ "%.2f"|format(cc.perf.avgpnl.a7) if cc.perf.avgpnl.a7 is not none else "na" }}</td>
+              <td class="right">{{ "%.2f"|format(cc.perf.avgpnl.aall) if cc.perf.avgpnl.aall is not none else "na" }}</td>
+              <td class="muted">-</td>
+            </tr>
+            <tr>
+              <td>Max SL rate</td>
+              <td class="right">{{ "%.1f"|format(cc.perf.slrate.stoday * 100) if cc.perf.slrate.stoday is not none else "na" }}%</td>
+              <td class="right">{{ "%.1f"|format(cc.perf.slrate.syday * 100) if cc.perf.slrate.syday is not none else "na" }}%</td>
+              <td class="right">{{ "%.1f"|format(cc.perf.slrate.s7 * 100) if cc.perf.slrate.s7 is not none else "na" }}%</td>
+              <td class="right">{{ "%.1f"|format(cc.perf.slrate.sall * 100) if cc.perf.slrate.sall is not none else "na" }}%</td>
+              <td class="{{ cc.perf.status.sl_class }}">{{ cc.perf.status.sl_text }}</td>
+            </tr>
+            <tr>
+              <td>Largest loss</td>
+              <td class="right pnl-neg">{{ "%.2f"|format(cc.perf.largestloss.ltoday) if cc.perf.largestloss.ltoday is not none else "na" }}</td>
+              <td class="right pnl-neg">{{ "%.2f"|format(cc.perf.largestloss.lyday) if cc.perf.largestloss.lyday is not none else "na" }}</td>
+              <td class="right pnl-neg">{{ "%.2f"|format(cc.perf.largestloss.l7) if cc.perf.largestloss.l7 is not none else "na" }}</td>
+              <td class="right pnl-neg">{{ "%.2f"|format(cc.perf.largestloss.lall) if cc.perf.largestloss.lall is not none else "na" }}</td>
+              <td class="muted">-</td>
+            </tr>
+            <tr>
+              <td>Sharpe (trade-level)</td>
+              <td class="right">{{ "%.2f"|format(cc.perf.sharpe.shtoday) if cc.perf.sharpe.shtoday is not none else "na" }}</td>
+              <td class="right">{{ "%.2f"|format(cc.perf.sharpe.shyday) if cc.perf.sharpe.shyday is not none else "na" }}</td>
+              <td class="right">{{ "%.2f"|format(cc.perf.sharpe.sh7) if cc.perf.sharpe.sh7 is not none else "na" }}</td>
+              <td class="right">{{ "%.2f"|format(cc.perf.sharpe.shall) if cc.perf.sharpe.shall is not none else "na" }}</td>
+              <td class="{{ cc.perf.status.sh_class }}">{{ cc.perf.status.sh_text }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
 
-    <h2>Kill Switch Monitor</h2>
-    <table>
-      <thead>
-        <tr><th>Metric</th><th>Current</th><th>Limit</th><th>Status</th></tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>Daily PnL</td>
-          <td class="{% if cc.kill.daily_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.kill.daily_pnl) }}</td>
-          <td>{{ "%.2f"|format(cc.kill.daily_limit) }}</td>
-          <td class="{% if cc.kill.daily_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.kill.daily_level|upper }}</td>
-        </tr>
-        <tr>
-          <td>Worst Open Unrealized</td>
-          <td class="{% if cc.kill.worst_open < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.kill.worst_open) }}</td>
-          <td>{{ "%.2f"|format(cc.kill.worst_open_limit) }}</td>
-          <td class="{% if cc.kill.worst_open_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.kill.worst_open_level|upper }}</td>
-        </tr>
-        <tr>
-          <td>Global Loss Streak</td>
-          <td>{{ cc.kill.loss_streak }}</td>
-          <td>{{ cc.kill.loss_streak_limit }}</td>
-          <td class="{% if cc.kill.loss_streak_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.kill.loss_streak_level|upper }}</td>
-        </tr>
-        <tr>
-          <td>Winrate (24h)</td>
-          <td>
-            {% if cc.kill.winrate_24h is none %}
-              <span class="muted">na ({{ cc.kill.trades_24h }} trades)</span>
+    <details class="section" open>
+      <summary>
+        <span class="sumtitle">Kill Switch Monitor</span>
+        <span class="sumhint">limits by mode</span>
+      </summary>
+      <div class="content">
+        <table id="tbl_kill" data-filterable="1">
+          <thead>
+            <tr><th>Metric</th><th class="right">Current</th><th class="right">Limit</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Daily PnL</td>
+              <td class="right {% if cc.kill.daily_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.kill.daily_pnl) }}</td>
+              <td class="right">{{ "%.2f"|format(cc.kill.daily_limit) }}</td>
+              <td class="{% if cc.kill.daily_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.kill.daily_level|upper }}</td>
+            </tr>
+            <tr>
+              <td>Worst Open Unrealized</td>
+              <td class="right {% if cc.kill.worst_open < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.kill.worst_open) }}</td>
+              <td class="right">{{ "%.2f"|format(cc.kill.worst_open_limit) }}</td>
+              <td class="{% if cc.kill.worst_open_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.kill.worst_open_level|upper }}</td>
+            </tr>
+            <tr>
+              <td>Global Loss Streak</td>
+              <td class="right">{{ cc.kill.loss_streak }}</td>
+              <td class="right">{{ cc.kill.loss_streak_limit }}</td>
+              <td class="{% if cc.kill.loss_streak_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.kill.loss_streak_level|upper }}</td>
+            </tr>
+            <tr>
+              <td>Winrate (24h)</td>
+              <td class="right">
+                {% if cc.kill.winrate_24h is none %}
+                  <span class="muted">na ({{ cc.kill.trades_24h }} trades)</span>
+                {% else %}
+                  {{ "%.1f"|format(cc.kill.winrate_24h * 100) }}% ({{ cc.kill.trades_24h }} trades)
+                {% endif %}
+              </td>
+              <td class="right">{{ "%.1f"|format(cc.kill.winrate_floor * 100) }}% (min {{ cc.kill.min_trades_24h }})</td>
+              <td class="{% if cc.kill.winrate_level == 'ok' %}pnl-pos{% elif cc.kill.winrate_level == 'na' %}muted{% else %}warn-txt{% endif %}">
+                {{ cc.kill.winrate_level|upper }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="kpirow">
+          <div class="kpi">DB TX: <span class="mono">{{ cc.status.db_tx_text }}</span></div>
+          <div class="kpi">Ingest lag: <span class="mono">{{ cc.status.ingest_text }}</span></div>
+          <div class="kpi">tmux: <span class="mono">{{ cc.status.tmux_text }}</span></div>
+          <div class="kpi">Last entry: <span class="mono">{{ cc.status.last_entry_text }}</span></div>
+          <div class="kpi">Last exit: <span class="mono">{{ cc.status.last_exit_text }}</span></div>
+        </div>
+      </div>
+    </details>
+
+    <details class="section" open>
+      <summary>
+        <span class="sumtitle">Filter Performance (Today)</span>
+        <span class="sumhint">latest scan + executed</span>
+      </summary>
+      <div class="content">
+        <div class="hint mono">
+          Markets scanned: <strong>{{ cc.filters.markets_scanned }}</strong> |
+          After base filters: <strong>{{ cc.filters.after_filters }}</strong> |
+          Would enter (scan): <strong>{{ cc.filters.scan_entries }}</strong> |
+          Trades executed (today): <strong>{{ cc.filters.trades_executed_today }}</strong>
+        </div>
+        <div class="subtools hint mono" style="margin-top:10px;">
+          Blocked:
+          <span class="chip">cap_per_market_outcome={{ cc.filters.blocked.cap_per_market_outcome }}</span>
+          <span class="chip">dislo_not_negative={{ cc.filters.blocked.dislo_not_negative }}</span>
+          <span class="chip">dislo_too_small={{ cc.filters.blocked.dislo_too_small }}</span>
+          <span class="chip">dislo_too_big={{ cc.filters.blocked.dislo_too_big }}</span>
+          <span class="chip">market_banned={{ cc.filters.blocked.market_banned }}</span>
+          <span class="chip">px_oob={{ cc.filters.blocked.px_oob }}</span>
+          <span class="chip">stale={{ cc.filters.blocked.stale }}</span>
+        </div>
+      </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <span class="sumtitle">Problem Positions</span>
+        <span class="sumhint">old and/or underwater</span>
+      </summary>
+      <div class="content">
+        {% if cc.problems %}
+        <table id="tbl_problems" data-filterable="1">
+          <thead>
+            <tr>
+              <th class="right">Age (h)</th>
+              <th>Market</th>
+              <th>Tags</th>
+              <th class="right">Entry</th>
+              <th class="right">Last</th>
+              <th class="right">Dislo%</th>
+              <th class="right">Unreal</th>
+              <th>Flag</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for p in cc.problems %}
+            <tr>
+              <td class="right">{{ "%.1f"|format(p.age_h) }}</td>
+              <td class="small">{{ p.market_name }}</td>
+              <td class="small">{{ p.tags }}</td>
+              <td class="right">{{ "%.4f"|format(p.entry_px) }}</td>
+              <td class="right">{{ "%.4f"|format(p.last_px) }}</td>
+              <td class="right">{{ "%.1f"|format(p.dislo_pct) }}</td>
+              <td class="right {% if p.unreal < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(p.unreal) }}</td>
+              <td class="{% if 'UNDERWATER' in p.flag or 'OLD' in p.flag %}warn-txt{% else %}muted{% endif %}">{{ p.flag }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <div class="small muted">No problem positions (or not available in this mode).</div>
+        {% endif %}
+      </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <span class="sumtitle">Market Intelligence</span>
+        <span class="sumhint">review candidates + top performers</span>
+      </summary>
+      <div class="content">
+        <div class="row" style="align-items: flex-start;">
+          <div style="flex:1 1 420px;">
+            <h3>Review Candidates</h3>
+            {% if cc.intel.review %}
+            <table id="tbl_review" data-filterable="1">
+              <thead><tr><th>Market</th><th class="right">Trades</th><th class="right">Sum PnL</th><th class="right">WR</th><th>Last</th></tr></thead>
+              <tbody>
+                {% for r in cc.intel.review %}
+                <tr>
+                  <td class="small">{{ r.market_name }}</td>
+                  <td class="right">{{ r.trades }}</td>
+                  <td class="right pnl-neg">{{ "%.2f"|format(r.sum_pnl) }}</td>
+                  <td class="right">{{ "%.0f"|format(r.winrate * 100) }}%</td>
+                  <td class="muted">{{ r.last_age }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
             {% else %}
-              {{ "%.1f"|format(cc.kill.winrate_24h * 100) }}% ({{ cc.kill.trades_24h }} trades)
+              <div class="small muted">na</div>
             {% endif %}
-          </td>
-          <td>{{ "%.1f"|format(cc.kill.winrate_floor * 100) }}% (min {{ cc.kill.min_trades_24h }})</td>
-          <td class="{% if cc.kill.winrate_level == 'ok' %}pnl-pos{% elif cc.kill.winrate_level == 'na' %}muted{% else %}warn-txt{% endif %}">
-            {{ cc.kill.winrate_level|upper }}
-          </td>
-        </tr>
-        <tr>
-          <td><strong>SYSTEM STATUS</strong></td>
-          <td colspan="3" class="{% if cc.kill.system_level == 'ok' %}pnl-pos{% elif cc.kill.system_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">
-            <strong>{{ cc.kill.system_level|upper }}</strong>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+          </div>
 
-    <h2>Filter Performance (Today)</h2>
-    <div class="strip mono small">
-      Markets scanned: <strong>{{ cc.filters.markets_scanned }}</strong> |
-      After base filters: <strong>{{ cc.filters.after_filters }}</strong> |
-      Would enter (scan): <strong>{{ cc.filters.scan_entries }}</strong> |
-      Trades executed (today): <strong>{{ cc.filters.trades_executed_today }}</strong>
-      <br><br>
-      Blocked by (latest scan):
-      cap_per_market_outcome={{ cc.filters.blocked.cap_per_market_outcome }},
-      dislo_not_negative={{ cc.filters.blocked.dislo_not_negative }},
-      dislo_too_small={{ cc.filters.blocked.dislo_too_small }},
-      dislo_too_big={{ cc.filters.blocked.dislo_too_big }},
-      market_banned={{ cc.filters.blocked.market_banned }},
-      px_oob={{ cc.filters.blocked.px_oob }},
-      stale={{ cc.filters.blocked.stale }}
-    </div>
-
-    <h2>Problem Positions</h2>
-    {% if cc.problems %}
-    <table>
-      <thead>
-        <tr>
-          <th>Age (h)</th>
-          <th>Market</th>
-          <th>Tags</th>
-          <th>Entry - Last</th>
-          <th>Dislo%</th>
-          <th>Unrealized</th>
-          <th>Flag</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for p in cc.problems %}
-        <tr>
-          <td>{{ "%.1f"|format(p.age_h) }}</td>
-          <td class="small">{{ p.market_name }}</td>
-          <td class="small">{{ p.tags }}</td>
-          <td>{{ "%.4f"|format(p.entry_px) }} - {{ "%.4f"|format(p.last_px) }}</td>
-          <td>{{ "%.1f"|format(p.dislo_pct) }}</td>
-          <td class="{% if p.unreal < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(p.unreal) }}</td>
-          <td class="{% if 'UNDERWATER' in p.flag or 'OLD' in p.flag %}warn-txt{% else %}muted{% endif %}">{{ p.flag }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}
-      <div class="small muted">No problem positions (or not available in this mode).</div>
-    {% endif %}
-
-    <h2>Market Intelligence</h2>
-    <div class="grid2">
-      <div>
-        <h3>Review Candidates</h3>
-        {% if cc.intel.review %}
-        <table>
-          <thead><tr><th>Market</th><th>Trades</th><th>Sum PnL</th><th>WR</th><th>Last</th></tr></thead>
-          <tbody>
-            {% for r in cc.intel.review %}
-            <tr>
-              <td class="small">{{ r.market_name }}</td>
-              <td>{{ r.trades }}</td>
-              <td class="pnl-neg">{{ "%.2f"|format(r.sum_pnl) }}</td>
-              <td>{{ "%.0f"|format(r.winrate * 100) }}%</td>
-              <td class="muted">{{ r.last_age }}</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-        {% else %}
-          <div class="small muted">na</div>
-        {% endif %}
+          <div style="flex:1 1 420px;">
+            <h3>Top Performers</h3>
+            {% if cc.intel.top %}
+            <table id="tbl_top" data-filterable="1">
+              <thead><tr><th>Market</th><th class="right">Trades</th><th class="right">Sum PnL</th><th class="right">WR</th><th>Last</th></tr></thead>
+              <tbody>
+                {% for r in cc.intel.top %}
+                <tr>
+                  <td class="small">{{ r.market_name }}</td>
+                  <td class="right">{{ r.trades }}</td>
+                  <td class="right pnl-pos">{{ "%.2f"|format(r.sum_pnl) }}</td>
+                  <td class="right">{{ "%.0f"|format(r.winrate * 100) }}%</td>
+                  <td class="muted">{{ r.last_age }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% else %}
+              <div class="small muted">na</div>
+            {% endif %}
+          </div>
+        </div>
       </div>
-
-      <div>
-        <h3>Top Performers</h3>
-        {% if cc.intel.top %}
-        <table>
-          <thead><tr><th>Market</th><th>Trades</th><th>Sum PnL</th><th>WR</th><th>Last</th></tr></thead>
-          <tbody>
-            {% for r in cc.intel.top %}
-            <tr>
-              <td class="small">{{ r.market_name }}</td>
-              <td>{{ r.trades }}</td>
-              <td class="pnl-pos">{{ "%.2f"|format(r.sum_pnl) }}</td>
-              <td>{{ "%.0f"|format(r.winrate * 100) }}%</td>
-              <td class="muted">{{ r.last_age }}</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-        {% else %}
-          <div class="small muted">na</div>
-        {% endif %}
-      </div>
-    </div>
+    </details>
 
   {% else %}
 
-    <div class="healthbar">
-      <div class="pill {{ health.db.status }}">
-        <span class="dot"></span>
-        <span class="label">DB</span>
-        <span class="value">{{ health.db.text }}</span>
-      </div>
-
-      <div class="pill {{ health.db_tx.status }}">
-        <span class="dot"></span>
-        <span class="label">DB TX</span>
-        <span class="value">{{ health.db_tx.text }}</span>
-      </div>
-
-      <div class="pill {{ health.ingest.status }}">
-        <span class="dot"></span>
-        <span class="label">Ingest</span>
-        <span class="value">{{ health.ingest.text }}</span>
-      </div>
-
-      <div class="pill {{ health.tmux.status }}">
-        <span class="dot"></span>
-        <span class="label">tmux</span>
-        <span class="value">{{ health.tmux.text }}</span>
-      </div>
-
-      <div class="pill {{ health.bots.status }}">
-        <span class="dot"></span>
-        <span class="label">Bots</span>
-        <span class="value">{{ health.bots.text }}</span>
-      </div>
-
-      <div class="pill {{ health.dashboard.status }}">
-        <span class="dot"></span>
-        <span class="label">Dashboard</span>
-        <span class="value">{{ health.dashboard.text }}</span>
-      </div>
-    </div>
-
-    <div class="summary">
+    <div class="grid">
       <div class="card">
         <div class="card-label">Closed PnL (Today)</div>
-        <div class="card-value {% if diag.today_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
-          {{ "%.2f"|format(diag.today_pnl) }}
-        </div>
+        <div class="card-value {% if diag.today_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(diag.today_pnl) }}</div>
       </div>
       <div class="card">
         <div class="card-label">Closed PnL (24h)</div>
-        <div class="card-value {% if diag.pnl_24h < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
-          {{ "%.2f"|format(diag.pnl_24h) }}
-        </div>
+        <div class="card-value {% if diag.pnl_24h < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(diag.pnl_24h) }}</div>
       </div>
       <div class="card">
         <div class="card-label">Closed PnL (7d)</div>
-        <div class="card-value {% if diag.pnl_7d < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
-          {{ "%.2f"|format(diag.pnl_7d) }}
-        </div>
+        <div class="card-value {% if diag.pnl_7d < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(diag.pnl_7d) }}</div>
       </div>
       <div class="card">
         <div class="card-label">Closed PnL (All)</div>
-        <div class="card-value {% if diag.total_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
-          {{ "%.2f"|format(diag.total_pnl) }}
-        </div>
+        <div class="card-value {% if diag.total_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(diag.total_pnl) }}</div>
       </div>
       <div class="card">
         <div class="card-label">Trades (closed)</div>
@@ -524,187 +779,150 @@ HTML = r"""
       </div>
     </div>
 
-    <h2>Open Positions</h2>
-    {% if diag.open_positions %}
-    <table>
-      <thead>
-        <tr>
-          <th>Entry TS</th>
-          <th>Market</th>
-          <th>Name</th>
-          <th>Tags</th>
-          <th>Outcome</th>
-          <th>Dislo%</th>
-          <th>Size</th>
-          <th>Entry Px</th>
-          <th>Cost</th>
-          <th>Last Px</th>
-          <th>Px %</th>
-          <th>Unrealized</th>
-          <th>Hours</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for p in diag.open_positions %}
-        <tr>
-          <td>{{ p.entry_ts }}</td>
-          <td class="small">{{ p.market_id[:16] }}…</td>
-          <td class="small">{{ p.market_name or '' }}</td>
-          <td class="small">{{ p.market_tags or '' }}</td>
-          <td>{{ p.outcome_label }}</td>
-          <td>{{ "%.1f"|format(p.dislocation * 100 if p.dislocation is not none else 0) }}</td>
-          <td>{{ "%.2f"|format(p.size or 0) }}</td>
-          <td>{{ "%.4f"|format(p.entry_price or 0) }}</td>
-          <td>{{ "%.2f"|format(p.cost or 0) }}</td>
-          <td>{{ "%.4f"|format(p.last_price or 0) }}</td>
-          <td class="{% if p.px_change_pct < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
-            {{ "%.1f"|format(p.px_change_pct or 0) }}%
-          </td>
-          <td class="{% if p.unrealized_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
-            {{ "%.2f"|format(p.unrealized_pnl) }}
-          </td>
-          <td>{{ "%.1f"|format(p.hours_open) }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}
-      <div class="small muted">No open positions (or not available in this mode).</div>
-    {% endif %}
-
-    <h2>Recent Closed Positions (last {{ diag.recent_closed|length }})</h2>
-    {% if diag.recent_closed %}
-    <table>
-      <thead>
-        <tr>
-          <th>Exit TS</th>
-          <th>Market</th>
-          <th>Name</th>
-          <th>Outcome</th>
-          <th>Entry Px</th>
-          <th>Exit Px</th>
-          <th>PnL</th>
-          <th>Exit</th>
-          <th>Hours</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for r in diag.recent_closed %}
-        <tr>
-          <td>{{ r.exit_ts }}</td>
-          <td class="small">{{ r.market_id[:16] }}…</td>
-          <td class="small">{{ r.market_name }}</td>
-          <td>{{ r.outcome_label }}</td>
-          <td>{{ "%.4f"|format(r.entry_price) }}</td>
-          <td>{{ "%.4f"|format(r.exit_price) }}</td>
-          <td class="{% if r.pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(r.pnl) }}</td>
-          <td>{{ r.exit_reason }}</td>
-          <td>{{ "%.1f"|format(r.hours_held) }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}
-      <div class="small muted">na</div>
-    {% endif %}
-
-    <h2>Killed Markets (last {{ diag.killed_markets|length }})</h2>
-    {% if diag.killed_markets %}
-    <table>
-      <thead>
-        <tr>
-          <th>Market</th>
-          <th>Name</th>
-          <th>Exit TS</th>
-          <th>Total PnL</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for k in diag.killed_markets %}
-        <tr>
-          <td class="small">{{ k.market_id[:16] }}… ({{ k.outcome_label }})</td>
-          <td class="small">{{ k.market_name }}</td>
-          <td>{{ k.exit_ts }}</td>
-          <td class="{% if k.total_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(k.total_pnl) }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}
-      <div class="small muted">na</div>
-    {% endif %}
-
-    <div class="grid2">
-      <div>
-        <h2>Dislocation Buckets ({{ diag.dislo_buckets|length }})</h2>
-        {% if diag.dislo_buckets %}
-        <table>
+    <details class="section" open>
+      <summary>
+        <span class="sumtitle">Open Positions</span>
+        <span class="sumhint">{{ diag.open_positions|length }} rows</span>
+      </summary>
+      <div class="content">
+        {% if diag.open_positions %}
+        <table id="tbl_open" data-filterable="1">
           <thead>
             <tr>
-              <th>Bucket</th><th>Min</th><th>Max</th><th>Trades</th><th>Avg PnL</th><th>Sum PnL</th><th>Winrate</th>
+              <th class="nowrap">Entry TS</th>
+              <th>Market</th>
+              <th>Name</th>
+              <th>Tags</th>
+              <th class="nowrap">Outcome</th>
+              <th class="right">Dislo%</th>
+              <th class="right">Size</th>
+              <th class="right">Entry</th>
+              <th class="right">Cost</th>
+              <th class="right">Last</th>
+              <th class="right">Px%</th>
+              <th class="right">Unreal</th>
+              <th class="right">Hours</th>
             </tr>
           </thead>
           <tbody>
-            {% for b in diag.dislo_buckets %}
+            {% for p in diag.open_positions %}
             <tr>
-              <td>{{ b.bucket }}</td>
-              <td>{{ "%.3f"|format(b.minv) }}</td>
-              <td>{{ "%.3f"|format(b.maxv) }}</td>
-              <td>{{ b.trades }}</td>
-              <td class="{% if b.avg_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(b.avg_pnl) }}</td>
-              <td class="{% if b.sum_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(b.sum_pnl) }}</td>
-              <td>{{ "%.1f"|format(b.winrate * 100) }}%</td>
+              <td class="nowrap small">{{ p.entry_ts }}</td>
+              <td class="small">
+                {{ p.market_id[:16] }}…
+                <button class="copy" data-copy="{{ p.market_id }}">copy</button>
+              </td>
+              <td class="small">{{ p.market_name or '' }}</td>
+              <td class="small">{{ p.market_tags or '' }}</td>
+              <td class="nowrap">{{ p.outcome_label }}</td>
+              <td class="right">{{ "%.1f"|format(p.dislocation * 100 if p.dislocation is not none else 0) }}</td>
+              <td class="right">{{ "%.2f"|format(p.size or 0) }}</td>
+              <td class="right">{{ "%.4f"|format(p.entry_price or 0) }}</td>
+              <td class="right">{{ "%.2f"|format(p.cost or 0) }}</td>
+              <td class="right">{{ "%.4f"|format(p.last_price or 0) }}</td>
+              <td class="right {% if p.px_change_pct < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.1f"|format(p.px_change_pct or 0) }}%</td>
+              <td class="right {% if p.unrealized_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(p.unrealized_pnl) }}</td>
+              <td class="right">{{ "%.1f"|format(p.hours_open) }}</td>
             </tr>
             {% endfor %}
           </tbody>
         </table>
         {% else %}
-          <div class="small muted">na</div>
+          <div class="small muted">No open positions (or not available in this mode).</div>
         {% endif %}
       </div>
+    </details>
 
-      <div>
-        <h2>Entry Price Buckets ({{ diag.entry_buckets|length }})</h2>
-        {% if diag.entry_buckets %}
-        <table>
+    <details class="section">
+      <summary>
+        <span class="sumtitle">Live Orders (strategy_orders)</span>
+        <span class="sumhint">{{ live_orders|length }} rows</span>
+      </summary>
+      <div class="content">
+        {% if live_orders %}
+        <table id="tbl_orders" data-filterable="1">
           <thead>
             <tr>
-              <th>Bucket</th><th>Min</th><th>Max</th><th>Trades</th><th>Avg PnL</th><th>Sum PnL</th><th>Winrate</th>
+              <th>ID</th>
+              <th class="nowrap">Created</th>
+              <th>Status</th>
+              <th>Market</th>
+              <th>Outcome</th>
+              <th>Side</th>
+              <th class="right">Qty</th>
+              <th class="right">Limit</th>
+              <th class="right">Post Notional</th>
+              <th class="right">Fill Qty</th>
+              <th class="right">Fill Avg</th>
+              <th class="nowrap">Last Fill</th>
+              <th>CLOB</th>
             </tr>
           </thead>
           <tbody>
-            {% for b in diag.entry_buckets %}
+          {% for o in live_orders %}
             <tr>
-              <td>{{ b.bucket }}</td>
-              <td>{{ "%.2f"|format(b.minv) }}</td>
-              <td>{{ "%.2f"|format(b.maxv) }}</td>
-              <td>{{ b.trades }}</td>
-              <td class="{% if b.avg_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(b.avg_pnl) }}</td>
-              <td class="{% if b.sum_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(b.sum_pnl) }}</td>
-              <td>{{ "%.1f"|format(b.winrate * 100) }}%</td>
+              <td class="small">{{ o.id }}</td>
+              <td class="nowrap small">{{ o.created_at }}</td>
+              <td class="small">{{ o.status }}</td>
+              <td class="small">
+                {{ o.market_id[:16] }}…
+                <button class="copy" data-copy="{{ o.market_id }}">copy</button>
+              </td>
+              <td class="small">{{ o.outcome }}</td>
+              <td class="small">{{ o.side }}</td>
+              <td class="right small">{{ "%.2f"|format((o.qty or 0)|float) if o.qty is not none else "" }}</td>
+              <td class="right small">{{ "%.2f"|format((o.limit_px or 0)|float) if o.limit_px is not none else "" }}</td>
+              <td class="right small">{{ "%.2f"|format((o.post_notional or 0)|float) if o.post_notional is not none else "" }}</td>
+              <td class="right small">{{ o.fill_qty }}</td>
+              <td class="right small">{{ "%.2f"|format((o.fill_avg_px or 0)|float) if o.fill_avg_px is not none else "" }}</td>
+              <td class="nowrap small">{{ o.last_fill_ts or "" }}</td>
+              <td class="small">{{ o.clob_order_id or "" }}</td>
             </tr>
-            {% endfor %}
+          {% endfor %}
           </tbody>
         </table>
         {% else %}
-          <div class="small muted">na</div>
+          <div class="small muted">No live orders.</div>
         {% endif %}
       </div>
-    </div>
+    </details>
 
-    <div class="grid2">
-      <div>
-        <h2>Worst Markets (24h) - top {{ diag.worst_markets|length }}</h2>
-        {% if diag.worst_markets %}
-        <table>
-          <thead><tr><th>Market</th><th>Trades</th><th>Sum PnL</th><th>WR</th></tr></thead>
-          <tbody>
-            {% for m in diag.worst_markets %}
+    <details class="section">
+      <summary>
+        <span class="sumtitle">Recent Closed Positions</span>
+        <span class="sumhint">{{ diag.recent_closed|length }} rows</span>
+      </summary>
+      <div class="content">
+        {% if diag.recent_closed %}
+        <table id="tbl_closed" data-filterable="1">
+          <thead>
             <tr>
-              <td class="small">{{ m.market_name }}</td>
-              <td>{{ m.trades }}</td>
-              <td class="pnl-neg">{{ "%.2f"|format(m.sum_pnl) }}</td>
-              <td>{{ "%.0f"|format(m.winrate * 100) }}%</td>
+              <th class="nowrap">Exit TS</th>
+              <th>Market</th>
+              <th>Name</th>
+              <th>Outcome</th>
+              <th class="right">Entry</th>
+              <th class="right">Exit</th>
+              <th class="right">PnL</th>
+              <th>Exit</th>
+              <th class="right">Hours</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in diag.recent_closed %}
+            <tr>
+              <td class="nowrap small">{{ r.exit_ts }}</td>
+              <td class="small">
+                {{ r.market_id[:16] }}…
+                <button class="copy" data-copy="{{ r.market_id }}">copy</button>
+              </td>
+              <td class="small">{{ r.market_name }}</td>
+              <td>{{ r.outcome_label }}</td>
+              <td class="right">{{ "%.4f"|format(r.entry_price) }}</td>
+              <td class="right">{{ "%.4f"|format(r.exit_price) }}</td>
+              <td class="right {% if r.pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(r.pnl) }}</td>
+              <td>{{ r.exit_reason }}</td>
+              <td class="right">{{ "%.1f"|format(r.hours_held) }}</td>
             </tr>
             {% endfor %}
           </tbody>
@@ -713,19 +931,34 @@ HTML = r"""
           <div class="small muted">na</div>
         {% endif %}
       </div>
+    </details>
 
-      <div>
-        <h2>Best Markets (24h) - top {{ diag.best_markets|length }}</h2>
-        {% if diag.best_markets %}
-        <table>
-          <thead><tr><th>Market</th><th>Trades</th><th>Sum PnL</th><th>WR</th></tr></thead>
-          <tbody>
-            {% for m in diag.best_markets %}
+    <details class="section">
+      <summary>
+        <span class="sumtitle">Killed Markets</span>
+        <span class="sumhint">{{ diag.killed_markets|length }} rows</span>
+      </summary>
+      <div class="content">
+        {% if diag.killed_markets %}
+        <table id="tbl_killed" data-filterable="1">
+          <thead>
             <tr>
-              <td class="small">{{ m.market_name }}</td>
-              <td>{{ m.trades }}</td>
-              <td class="pnl-pos">{{ "%.2f"|format(m.sum_pnl) }}</td>
-              <td>{{ "%.0f"|format(m.winrate * 100) }}%</td>
+              <th>Market</th>
+              <th>Name</th>
+              <th class="nowrap">Exit TS</th>
+              <th class="right">Total PnL</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for k in diag.killed_markets %}
+            <tr>
+              <td class="small">
+                {{ k.market_id[:16] }}… ({{ k.outcome_label }})
+                <button class="copy" data-copy="{{ k.market_id }}">copy</button>
+              </td>
+              <td class="small">{{ k.market_name }}</td>
+              <td class="nowrap">{{ k.exit_ts }}</td>
+              <td class="right {% if k.total_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(k.total_pnl) }}</td>
             </tr>
             {% endfor %}
           </tbody>
@@ -734,7 +967,125 @@ HTML = r"""
           <div class="small muted">na</div>
         {% endif %}
       </div>
-    </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <span class="sumtitle">Buckets</span>
+        <span class="sumhint">dislocation + entry price</span>
+      </summary>
+      <div class="content">
+        <div class="row" style="align-items:flex-start;">
+          <div style="flex:1 1 520px;">
+            <h3>Dislocation Buckets ({{ diag.dislo_buckets|length }})</h3>
+            {% if diag.dislo_buckets %}
+            <table id="tbl_dislo" data-filterable="1">
+              <thead>
+                <tr>
+                  <th class="right">Bucket</th><th class="right">Min</th><th class="right">Max</th><th class="right">Trades</th><th class="right">Avg PnL</th><th class="right">Sum PnL</th><th class="right">WR</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for b in diag.dislo_buckets %}
+                <tr>
+                  <td class="right">{{ b.bucket }}</td>
+                  <td class="right">{{ "%.3f"|format(b.minv) }}</td>
+                  <td class="right">{{ "%.3f"|format(b.maxv) }}</td>
+                  <td class="right">{{ b.trades }}</td>
+                  <td class="right {% if b.avg_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(b.avg_pnl) }}</td>
+                  <td class="right {% if b.sum_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(b.sum_pnl) }}</td>
+                  <td class="right">{{ "%.1f"|format(b.winrate * 100) }}%</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% else %}
+              <div class="small muted">na</div>
+            {% endif %}
+          </div>
+
+          <div style="flex:1 1 520px;">
+            <h3>Entry Price Buckets ({{ diag.entry_buckets|length }})</h3>
+            {% if diag.entry_buckets %}
+            <table id="tbl_entry" data-filterable="1">
+              <thead>
+                <tr>
+                  <th class="right">Bucket</th><th class="right">Min</th><th class="right">Max</th><th class="right">Trades</th><th class="right">Avg PnL</th><th class="right">Sum PnL</th><th class="right">WR</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for b in diag.entry_buckets %}
+                <tr>
+                  <td class="right">{{ b.bucket }}</td>
+                  <td class="right">{{ "%.2f"|format(b.minv) }}</td>
+                  <td class="right">{{ "%.2f"|format(b.maxv) }}</td>
+                  <td class="right">{{ b.trades }}</td>
+                  <td class="right {% if b.avg_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(b.avg_pnl) }}</td>
+                  <td class="right {% if b.sum_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(b.sum_pnl) }}</td>
+                  <td class="right">{{ "%.1f"|format(b.winrate * 100) }}%</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% else %}
+              <div class="small muted">na</div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="section">
+      <summary>
+        <span class="sumtitle">Best / Worst Markets (24h)</span>
+        <span class="sumhint">top {{ diag.worst_markets|length }} worst + top {{ diag.best_markets|length }} best</span>
+      </summary>
+      <div class="content">
+        <div class="row" style="align-items:flex-start;">
+          <div style="flex:1 1 520px;">
+            <h3>Worst</h3>
+            {% if diag.worst_markets %}
+            <table id="tbl_worst" data-filterable="1">
+              <thead><tr><th>Market</th><th class="right">Trades</th><th class="right">Sum PnL</th><th class="right">WR</th></tr></thead>
+              <tbody>
+                {% for m in diag.worst_markets %}
+                <tr>
+                  <td class="small">{{ m.market_name }}</td>
+                  <td class="right">{{ m.trades }}</td>
+                  <td class="right pnl-neg">{{ "%.2f"|format(m.sum_pnl) }}</td>
+                  <td class="right">{{ "%.0f"|format(m.winrate * 100) }}%</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% else %}
+              <div class="small muted">na</div>
+            {% endif %}
+          </div>
+
+          <div style="flex:1 1 520px;">
+            <h3>Best</h3>
+            {% if diag.best_markets %}
+            <table id="tbl_best" data-filterable="1">
+              <thead><tr><th>Market</th><th class="right">Trades</th><th class="right">Sum PnL</th><th class="right">WR</th></tr></thead>
+              <tbody>
+                {% for m in diag.best_markets %}
+                <tr>
+                  <td class="small">{{ m.market_name }}</td>
+                  <td class="right">{{ m.trades }}</td>
+                  <td class="right pnl-pos">{{ "%.2f"|format(m.sum_pnl) }}</td>
+                  <td class="right">{{ "%.0f"|format(m.winrate * 100) }}%</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% else %}
+              <div class="small muted">na</div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </details>
 
   {% endif %}
 
@@ -753,24 +1104,47 @@ def to_dec(x):
 
 
 def get_conn():
-    return connect(DB_URL, row_factory=dict_row)
+    conn = connect(
+        DB_URL,
+        row_factory=dict_row,
+        options=(
+            "-c statement_timeout=5000 "
+            "-c lock_timeout=1000 "
+            "-c idle_in_transaction_session_timeout=30000"
+        ),
+    )
+    conn.autocommit = True
+    return conn
 
 
-def _run(cmd, timeout=2):
+def _run(cmd, timeout: int = 2):
+    """
+    Run a command safely with a hard timeout and capped output.
+    Returns (returncode, stdout, stderr)
+    """
     try:
         res = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
         )
-        return res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip()
+        out = res.stdout or ""
+        err = res.stderr or ""
+    except subprocess.TimeoutExpired:
+        return 124, "", f"TIMEOUT after {timeout}s"
     except Exception as e:
-        return 999, "", str(e)
+        return 1, "", f"ERROR: {e}"
 
+    # Cap output to avoid huge logs hanging the request / memory blowups
+    MAX_CHARS = 8000
+    if len(out) > MAX_CHARS:
+        out = out[:MAX_CHARS] + "\n...[truncated]"
+    if len(err) > MAX_CHARS:
+        err = err[:MAX_CHARS] + "\n...[truncated]"
 
+    return res.returncode, out, err
 def _file_age_secs(path: Path):
     try:
         return max(0, (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime))
@@ -865,8 +1239,29 @@ def _limits_for_mode(mode):
     }
 
 
+def _outcome_label(v):
+    """
+    Special casing:
+      FI/fi -> Yes
+      KT/kt -> No
+    plus common numeric/string variants.
+    """
+    s = str(v).strip()
+    if s in ("FI", "fi"):
+        return "Yes"
+    if s in ("KT", "kt"):
+        return "No"
+    if s in ("1", "yes", "Yes", "true", "True", "Y", "y"):
+        return "Yes"
+    if s in ("0", "no", "No", "false", "False", "N", "n", "2"):
+        return "No"
+    # fallback
+    return "Yes" if s == "1" else "No"
+
+
+
 # ------------------------------------------------------------
-# DB idle-in-transaction probe (NEW)
+# DB idle-in-transaction probe
 # ------------------------------------------------------------
 def _load_idle_in_transaction(cur):
     r = _safe_fetchone(
@@ -891,12 +1286,17 @@ def _load_open_positions(cur, strategy, mode):
           p.*,
           COALESCE(m.question, p.market_id) AS market_name,
           m.tags AS market_tags,
-          (SELECT price FROM raw_trades rt
-           WHERE rt.market_id = p.market_id
-             AND rt.outcome = p.outcome
-           ORDER BY rt.ts DESC LIMIT 1) AS last_price
+          rt_last.price AS last_price
         FROM {tbl} p
         LEFT JOIN markets m ON m.market_id = p.market_id
+        LEFT JOIN LATERAL (
+          SELECT price
+          FROM raw_trades rt
+          WHERE rt.market_id = p.market_id
+            AND rt.outcome = p.outcome
+          ORDER BY rt.ts DESC
+          LIMIT 1
+        ) rt_last ON true
         WHERE (%s = 'all' OR p.strategy = %s)
           AND COALESCE(p.status, 'open') = 'open'
         ORDER BY p.entry_ts DESC;
@@ -914,14 +1314,10 @@ def _load_open_positions(cur, strategy, mode):
         if str(p.get("side", "")).lower() == "short":
             unreal = -unreal
 
-        hours_open = 0.0
         try:
             hours_open = (datetime.now(timezone.utc) - p.get("entry_ts")).total_seconds() / 3600
         except Exception:
             hours_open = 0.0
-
-        o = str(p.get("outcome"))
-        outcome_label = "Yes" if o == "1" else "No"
 
         market_tags = p.get("market_tags")
         tags_txt = ", ".join(market_tags) if isinstance(market_tags, list) else (market_tags or "")
@@ -932,7 +1328,7 @@ def _load_open_positions(cur, strategy, mode):
                 "market_id": p.get("market_id") or "",
                 "market_name": p.get("market_name") or p.get("market_id") or "",
                 "market_tags": tags_txt,
-                "outcome_label": outcome_label,
+                "outcome_label": _outcome_label(p.get("outcome")),
                 "dislocation": to_dec(p.get("dislocation")),
                 "size": float(size),
                 "entry_price": float(entry),
@@ -944,6 +1340,48 @@ def _load_open_positions(cur, strategy, mode):
             }
         )
     return out
+
+
+def _load_live_orders(cur, strategy, limit_n=200):
+    return _safe_fetchall(
+        cur,
+        f"""
+        SELECT
+          o.id,
+          o.created_at,
+          o.strategy,
+          o.status,
+          o.market_id,
+          o.outcome,
+          o.side,
+          o.qty,
+          o.limit_px,
+          (o.metadata->>'clob_order_id') AS clob_order_id,
+          (o.metadata->>'post_notional') AS post_notional,
+          COALESCE(f.fill_qty, 0) AS fill_qty,
+          f.fill_avg_px,
+          f.last_fill_ts
+        FROM strategy_orders o
+        LEFT JOIN (
+          SELECT
+            order_id,
+            SUM(qty)::numeric AS fill_qty,
+            CASE
+              WHEN SUM(qty) > 0 THEN SUM(qty * price) / SUM(qty)
+              ELSE NULL
+            END AS fill_avg_px,
+            MAX(ts) AS last_fill_ts
+          FROM strategy_fills
+          WHERE paper=false
+          GROUP BY order_id
+        ) f ON f.order_id = o.id
+        WHERE o.paper = false
+          AND (%s = 'all' OR o.strategy = %s)
+        ORDER BY o.created_at DESC
+        LIMIT {int(limit_n)}
+        """,
+        (strategy, strategy),
+    )
 
 
 def _load_closed_rollups(cur, strategy, mode):
@@ -995,18 +1433,30 @@ def _sharpe_from_pnls(pnls):
         return None
     return (mu / sd) * (len(pnls) ** 0.5)
 
-
 def _load_perf_time_range(cur, strategy, mode, where_time_sql: str, params_tail=()):
     """
-    Loads perf stats for an arbitrary WHERE time clause.
-    where_time_sql should start with 'AND ...'
+    Fast aggregate perf stats using SQL only.
+    where_time_sql must start with 'AND ...'
     """
     tbl = _positions_table_for_mode(mode)
     params = [strategy, strategy]
     params.extend(list(params_tail))
 
     sql = f"""
-        SELECT pnl, exit_reason
+        SELECT
+          COUNT(*)::int AS trades,
+          COALESCE(SUM(pnl), 0)::numeric AS pnl,
+          AVG(CASE WHEN pnl > 0 THEN 1.0 ELSE 0.0 END)::float AS winrate,
+          AVG(pnl)::float AS avg_pnl,
+          AVG(
+            CASE
+              WHEN lower(coalesce(exit_reason,'')) IN ('sl','max_sl')
+                OR lower(coalesce(exit_reason,'')) LIKE '%max_sl%'
+              THEN 1.0 ELSE 0.0
+            END
+          )::float AS sl_rate,
+          MIN(pnl)::numeric AS largest_loss,
+          STDDEV_POP(pnl)::float AS sd_pnl
         FROM {tbl}
         WHERE (%s='all' OR strategy=%s)
           AND COALESCE(status,'closed')='closed'
@@ -1014,98 +1464,36 @@ def _load_perf_time_range(cur, strategy, mode, where_time_sql: str, params_tail=
           AND exit_ts IS NOT NULL
           {where_time_sql};
     """
-    rows = _safe_fetchall(cur, sql, tuple(params))
+    r = _safe_fetchone(cur, sql, tuple(params))
 
-    pnls = []
-    wins = 0
-    sls = 0
-    largest_loss = None
-    for r in rows:
-        pnl = to_dec(r.get("pnl"))
-        if pnl is None:
-            continue
-        pv = float(pnl)
-        pnls.append(pv)
-        if pv > 0:
-            wins += 1
-        if _is_sl_exit(r.get("exit_reason")):
-            sls += 1
-        if largest_loss is None:
-            largest_loss = pv
-        else:
-            largest_loss = min(largest_loss, pv)
+    n = int(r.get("trades") or 0)
+    total = float(to_dec(r.get("pnl")) or 0)
+    wr = r.get("winrate")
+    avg = r.get("avg_pnl")
+    slr = r.get("sl_rate")
+    largest_loss = r.get("largest_loss")
+    sd = r.get("sd_pnl")
 
-    n = len(pnls)
-    total = float(sum(pnls)) if pnls else 0.0
-    wr = (wins / n) if n else None
-    avg = (total / n) if n else None
-    sl_rate = (sls / n) if n else None
-    sharpe = _sharpe_from_pnls(pnls)
+    sharpe = None
+    if n >= 2 and avg is not None and sd is not None and sd != 0:
+        sharpe = (float(avg) / float(sd)) * (n ** 0.5)
 
     return {
         "trades": n,
         "pnl": total,
-        "winrate": wr,
-        "avg_pnl": avg,
-        "sl_rate": sl_rate,
-        "largest_loss": largest_loss,
-        "sharpe": sharpe,
+        "winrate": float(wr) if wr is not None else None,
+        "avg_pnl": float(avg) if avg is not None else None,
+        "sl_rate": float(slr) if slr is not None else None,
+        "largest_loss": float(to_dec(largest_loss)) if largest_loss is not None else None,
+        "sharpe": float(sharpe) if sharpe is not None else None,
     }
-
 
 def _load_perf_window(cur, strategy, mode, since_interval_sql: str | None):
-    tbl = _positions_table_for_mode(mode)
     where_time = ""
-    params = [strategy, strategy]
     if since_interval_sql:
+        # since_interval_sql is controlled by this file (not user input)
         where_time = f" AND exit_ts >= (NOW() - INTERVAL '{since_interval_sql}')"
-
-    sql = f"""
-        SELECT pnl, exit_reason
-        FROM {tbl}
-        WHERE (%s='all' OR strategy=%s)
-          AND COALESCE(status,'closed')='closed'
-          AND pnl IS NOT NULL
-          AND exit_ts IS NOT NULL
-          {where_time};
-    """
-    rows = _safe_fetchall(cur, sql, tuple(params))
-    pnls = []
-    wins = 0
-    sls = 0
-    largest_loss = None
-    for r in rows:
-        pnl = to_dec(r.get("pnl"))
-        if pnl is None:
-            continue
-        pv = float(pnl)
-        pnls.append(pv)
-        if pv > 0:
-            wins += 1
-        if _is_sl_exit(r.get("exit_reason")):
-            sls += 1
-        if largest_loss is None:
-            largest_loss = pv
-        else:
-            largest_loss = min(largest_loss, pv)
-
-    n = len(pnls)
-    total = float(sum(pnls)) if pnls else 0.0
-    wr = (wins / n) if n else None
-    avg = (total / n) if n else None
-    sl_rate = (sls / n) if n else None
-    sharpe = _sharpe_from_pnls(pnls)
-
-    return {
-        "trades": n,
-        "pnl": total,
-        "winrate": wr,
-        "avg_pnl": avg,
-        "sl_rate": sl_rate,
-        "largest_loss": largest_loss,
-        "sharpe": sharpe,
-    }
-
+    return _load_perf_time_range(cur, strategy, mode, where_time)
 
 def _merge_perf(a, b):
     trades = (a["trades"] or 0) + (b["trades"] or 0)
@@ -1123,12 +1511,14 @@ def _merge_perf(a, b):
     winrate = wavg(a.get("winrate"), b.get("winrate"))
     avg_pnl = (pnl / trades) if trades else None
     sl_rate = wavg(a.get("sl_rate"), b.get("sl_rate"))
+
     largest_loss = None
     for v in (a.get("largest_loss"), b.get("largest_loss")):
         if v is None:
             continue
         largest_loss = v if largest_loss is None else min(largest_loss, v)
 
+    # sharpe not merged (kept None for combined view)
     sharpe = None
 
     return {
@@ -1146,8 +1536,10 @@ def _load_performance_snapshot(cur, strategy, mode):
     def one_mode_snap(m):
         ptoday = _load_perf_time_range(cur, strategy, m, "AND exit_ts >= CURRENT_DATE")
         pyday = _load_perf_time_range(
-            cur, strategy, m,
-            "AND exit_ts >= (CURRENT_DATE - INTERVAL '1 day') AND exit_ts < CURRENT_DATE"
+            cur,
+            strategy,
+            m,
+            "AND exit_ts >= (CURRENT_DATE - INTERVAL '1 day') AND exit_ts < CURRENT_DATE",
         )
         p7 = _load_perf_window(cur, strategy, m, "7 days")
         pall = _load_perf_window(cur, strategy, m, None)
@@ -1182,10 +1574,14 @@ def _load_performance_snapshot(cur, strategy, mode):
         sh_text = "GOOD" if sh_ok else "CHECK"
 
         return {
-            "pnl_class": pnl_class, "pnl_text": pnl_text,
-            "wr_class": wr_class, "wr_text": wr_text,
-            "sl_class": sl_class, "sl_text": sl_text,
-            "sh_class": sh_class, "sh_text": sh_text,
+            "pnl_class": pnl_class,
+            "pnl_text": pnl_text,
+            "wr_class": wr_class,
+            "wr_text": wr_text,
+            "sl_class": sl_class,
+            "sl_text": sl_text,
+            "sh_class": sh_class,
+            "sh_text": sh_text,
         }
 
     return {
@@ -1226,30 +1622,29 @@ def _load_recent_closed(cur, strategy, mode, limit_n):
     for r in rows:
         entry_ts = r.get("entry_ts")
         exit_ts = r.get("exit_ts")
-        hours = 0.0
         try:
             hours = (exit_ts - entry_ts).total_seconds() / 3600 if entry_ts and exit_ts else 0.0
         except Exception:
             hours = 0.0
-        o = str(r.get("outcome"))
-        outcome_label = "Yes" if o == "1" else "No"
-        out.append({
-            "market_id": r.get("market_id") or "",
-            "market_name": r.get("market_name") or r.get("market_id") or "",
-            "outcome_label": outcome_label,
-            "entry_price": float(to_dec(r.get("entry_price")) or 0),
-            "exit_price": float(to_dec(r.get("exit_price")) or 0),
-            "exit_ts": r.get("exit_ts"),
-            "pnl": float(to_dec(r.get("pnl")) or 0),
-            "exit_reason": r.get("exit_reason") or "",
-            "hours_held": float(hours),
-        })
+
+        out.append(
+            {
+                "market_id": r.get("market_id") or "",
+                "market_name": r.get("market_name") or r.get("market_id") or "",
+                "outcome_label": _outcome_label(r.get("outcome")),
+                "entry_price": float(to_dec(r.get("entry_price")) or 0),
+                "exit_price": float(to_dec(r.get("exit_price")) or 0),
+                "exit_ts": r.get("exit_ts"),
+                "pnl": float(to_dec(r.get("pnl")) or 0),
+                "exit_reason": r.get("exit_reason") or "",
+                "hours_held": float(hours),
+            }
+        )
     return out
 
 
 def _load_killed_markets(cur, strategy, mode, limit_n):
     tbl = _positions_table_for_mode(mode)
-
     sql = f"""
         SELECT
           p.market_id,
@@ -1277,15 +1672,15 @@ def _load_killed_markets(cur, strategy, mode, limit_n):
     rows = _safe_fetchall(cur, sql, (strategy, strategy, strategy, strategy))
     out = []
     for r in rows:
-        o = str(r.get("outcome"))
-        outcome_label = "Yes" if o == "1" else "No"
-        out.append({
-            "market_id": r.get("market_id") or "",
-            "market_name": r.get("market_name") or r.get("market_id") or "",
-            "outcome_label": outcome_label,
-            "exit_ts": r.get("exit_ts"),
-            "total_pnl": float(to_dec(r.get("total_pnl")) or 0),
-        })
+        out.append(
+            {
+                "market_id": r.get("market_id") or "",
+                "market_name": r.get("market_name") or r.get("market_id") or "",
+                "outcome_label": _outcome_label(r.get("outcome")),
+                "exit_ts": r.get("exit_ts"),
+                "total_pnl": float(to_dec(r.get("total_pnl")) or 0),
+            }
+        )
     return out
 
 
@@ -1302,14 +1697,7 @@ def _bucket_edges(minv: Decimal, maxv: Decimal, step: Decimal):
 def _make_buckets(rows, key_fn, edges):
     buckets = []
     for i in range(len(edges) - 1):
-        buckets.append({
-            "bucket": i + 1,
-            "minv": float(edges[i]),
-            "maxv": float(edges[i + 1]),
-            "trades": 0,
-            "sum_pnl": 0.0,
-            "wins": 0,
-        })
+        buckets.append({"bucket": i + 1, "minv": float(edges[i]), "maxv": float(edges[i + 1]), "trades": 0, "sum_pnl": 0.0, "wins": 0})
 
     for r in rows:
         k = key_fn(r)
@@ -1337,15 +1725,17 @@ def _make_buckets(rows, key_fn, edges):
     for b in buckets:
         if b["trades"] == 0:
             continue
-        out.append({
-            "bucket": b["bucket"],
-            "minv": b["minv"],
-            "maxv": b["maxv"],
-            "trades": b["trades"],
-            "avg_pnl": b["sum_pnl"] / b["trades"],
-            "sum_pnl": b["sum_pnl"],
-            "winrate": b["wins"] / b["trades"],
-        })
+        out.append(
+            {
+                "bucket": b["bucket"],
+                "minv": b["minv"],
+                "maxv": b["maxv"],
+                "trades": b["trades"],
+                "avg_pnl": b["sum_pnl"] / b["trades"],
+                "sum_pnl": b["sum_pnl"],
+                "winrate": b["wins"] / b["trades"],
+            }
+        )
     return out
 
 
@@ -1382,12 +1772,14 @@ def _load_best_worst_markets_24h(cur, strategy, mode, limit_n):
     rows = _safe_fetchall(cur, sql, (strategy, strategy))
     items = []
     for r in rows:
-        items.append({
-            "market_name": r.get("market_name") or r.get("market_id"),
-            "trades": int(r.get("trades") or 0),
-            "sum_pnl": float(to_dec(r.get("sum_pnl")) or 0),
-            "winrate": float(r.get("winrate") or 0.0),
-        })
+        items.append(
+            {
+                "market_name": r.get("market_name") or r.get("market_id"),
+                "trades": int(r.get("trades") or 0),
+                "sum_pnl": float(to_dec(r.get("sum_pnl")) or 0),
+                "winrate": float(r.get("winrate") or 0.0),
+            }
+        )
     worst = sorted(items, key=lambda x: x["sum_pnl"])[: int(limit_n)]
     best = sorted(items, key=lambda x: x["sum_pnl"], reverse=True)[: int(limit_n)]
     return worst, best
@@ -1433,11 +1825,7 @@ def _parse_latest_scan_from_log(lines):
         if top_raw is not None and scan:
             break
 
-    return {
-        "raw": top_raw or 0,
-        "after_filters": top_after or 0,
-        "scan": scan or {},
-    }
+    return {"raw": top_raw or 0, "after_filters": top_after or 0, "scan": scan or {}}
 
 
 def _filters_today_from_log(strategy):
@@ -1461,8 +1849,112 @@ def _filters_today_from_log(strategy):
             "market_banned": int(scan.get("market_banned", 0) or 0),
             "px_oob": int(scan.get("px_oob", 0) or 0),
             "stale": int(scan.get("stale", 0) or 0),
-        }
+        },
     }
+
+
+def _load_loss_streak(cur, strategy, mode, lookback=50):
+    """
+    Consecutive losing trades from most recent closed exits.
+    For mode='both' we look across live+paper combined ordered by exit_ts.
+    """
+    if mode in ("live", "paper"):
+        tbl = _positions_table_for_mode(mode)
+        rows = _safe_fetchall(
+            cur,
+            f"""
+            SELECT pnl
+            FROM {tbl}
+            WHERE (%s='all' OR strategy=%s)
+              AND COALESCE(status,'closed')='closed'
+              AND pnl IS NOT NULL
+              AND exit_ts IS NOT NULL
+            ORDER BY exit_ts DESC
+            LIMIT {int(lookback)};
+            """,
+            (strategy, strategy),
+        )
+    else:
+        rows = _safe_fetchall(
+            cur,
+            f"""
+            SELECT pnl
+            FROM (
+              SELECT pnl, exit_ts FROM mr_positions
+              WHERE (%s='all' OR strategy=%s)
+                AND COALESCE(status,'closed')='closed'
+                AND pnl IS NOT NULL
+                AND exit_ts IS NOT NULL
+              UNION ALL
+              SELECT pnl, exit_ts FROM paper_positions
+              WHERE (%s='all' OR strategy=%s)
+                AND COALESCE(status,'closed')='closed'
+                AND pnl IS NOT NULL
+                AND exit_ts IS NOT NULL
+            ) x
+            ORDER BY exit_ts DESC
+            LIMIT {int(lookback)};
+            """,
+            (strategy, strategy, strategy, strategy),
+        )
+
+    streak = 0
+    for r0 in rows:
+        pnl = to_dec(r0.get("pnl"))
+        if pnl is None:
+            continue
+        if pnl < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _load_24h_wr(cur, strategy, mode):
+    """
+    Returns (trades_24h, wins_24h)
+    """
+    if mode in ("live", "paper"):
+        tbl = _positions_table_for_mode(mode)
+        w = _safe_fetchone(
+            cur,
+            f"""
+            SELECT COUNT(*) AS trades, COUNT(*) FILTER (WHERE pnl > 0) AS wins
+            FROM {tbl}
+            WHERE (%s='all' OR strategy=%s)
+              AND COALESCE(status,'closed')='closed'
+              AND exit_ts >= (NOW() - INTERVAL '24 hours');
+            """,
+            (strategy, strategy),
+        )
+        return int(w.get("trades") or 0), int(w.get("wins") or 0)
+
+    w = _safe_fetchone(
+        cur,
+        """
+        SELECT
+          (SELECT COUNT(*) FROM mr_positions
+            WHERE (%s='all' OR strategy=%s)
+              AND COALESCE(status,'closed')='closed'
+              AND exit_ts >= (NOW() - INTERVAL '24 hours')) +
+          (SELECT COUNT(*) FROM paper_positions
+            WHERE (%s='all' OR strategy=%s)
+              AND COALESCE(status,'closed')='closed'
+              AND exit_ts >= (NOW() - INTERVAL '24 hours')) AS trades,
+          (SELECT COUNT(*) FROM mr_positions
+            WHERE (%s='all' OR strategy=%s)
+              AND COALESCE(status,'closed')='closed'
+              AND exit_ts >= (NOW() - INTERVAL '24 hours')
+              AND pnl > 0) +
+          (SELECT COUNT(*) FROM paper_positions
+            WHERE (%s='all' OR strategy=%s)
+              AND COALESCE(status,'closed')='closed'
+              AND exit_ts >= (NOW() - INTERVAL '24 hours')
+              AND pnl > 0) AS wins;
+        """,
+        (strategy, strategy, strategy, strategy, strategy, strategy, strategy, strategy),
+    )
+    return int(w.get("trades") or 0), int(w.get("wins") or 0)
 
 
 @app.route("/")
@@ -1498,13 +1990,7 @@ def index():
         "status": {},
         "kill": {},
         "perf": {},
-        "filters": {
-            "markets_scanned": 0,
-            "after_filters": 0,
-            "scan_entries": 0,
-            "trades_executed_today": 0,
-            "blocked": {},
-        },
+        "filters": {"markets_scanned": 0, "after_filters": 0, "scan_entries": 0, "trades_executed_today": 0, "blocked": {}},
         "problems": [],
         "intel": {"review": [], "top": []},
     }
@@ -1528,13 +2014,14 @@ def index():
 
     idle_cnt = 0
     idle_age = 0
+    live_orders = []
 
     try:
         with get_conn() as conn, conn.cursor() as cur:
             _ = _safe_fetchone(cur, "SELECT 1 AS ok;")
             health["db"] = {"status": "ok", "text": "connected"}
 
-            # DB TX health (NEW)
+            # DB TX health
             idle_cnt, idle_age = _load_idle_in_transaction(cur)
             if idle_cnt == 0:
                 health["db_tx"] = {"status": "ok", "text": "0"}
@@ -1577,18 +2064,23 @@ def index():
                 "text": f"sf {_fmt_age(smartflow_age)} - mr_v1 {_fmt_age(mr_v1_age)} - mr_v2 {_fmt_age(mr_v2_age)}",
             }
 
+            # Live orders (strategy_orders) - only needed on diagnostics view
+            if view != "command":
+                live_orders = _load_live_orders(cur, strategy, 200)
+            else:
+                live_orders = []
+
             # Load open positions for selected mode
             if mode in ("live", "paper"):
                 open_positions = _load_open_positions(cur, strategy, mode)
             else:
-                live_open = _load_open_positions(cur, strategy, "live")
-                paper_open = _load_open_positions(cur, strategy, "paper")
-                open_positions = live_open + paper_open
+                open_positions = _load_open_positions(cur, strategy, "live") + _load_open_positions(cur, strategy, "paper")
 
             # Diagnostics rollup (selected mode)
             if view != "command":
                 if mode in ("live", "paper"):
                     diag_roll = _load_closed_rollups(cur, strategy, mode)
+                    diag.update(diag_roll)
                 else:
                     l = _load_closed_rollups(cur, strategy, "live")
                     p = _load_closed_rollups(cur, strategy, "paper")
@@ -1599,61 +2091,51 @@ def index():
                     if p["winrate"] is not None:
                         winners += int(round(p["winrate"] * p["closed_trades"]))
                     winrate = (winners / closed_trades) if closed_trades else None
-                    diag_roll = {
-                        "today_pnl": l["today_pnl"] + p["today_pnl"],
-                        "pnl_24h": l["pnl_24h"] + p["pnl_24h"],
-                        "pnl_7d": l["pnl_7d"] + p["pnl_7d"],
-                        "total_pnl": l["total_pnl"] + p["total_pnl"],
-                        "closed_trades": closed_trades,
-                        "open_trades": (l["open_trades"] or 0) + (p["open_trades"] or 0),
-                        "winrate": winrate,
-                    }
-                diag.update(diag_roll)
+                    diag.update(
+                        {
+                            "today_pnl": l["today_pnl"] + p["today_pnl"],
+                            "pnl_24h": l["pnl_24h"] + p["pnl_24h"],
+                            "pnl_7d": l["pnl_7d"] + p["pnl_7d"],
+                            "total_pnl": l["total_pnl"] + p["total_pnl"],
+                            "closed_trades": closed_trades,
+                            "open_trades": (l["open_trades"] or 0) + (p["open_trades"] or 0),
+                            "winrate": winrate,
+                        }
+                    )
+
                 diag["open_positions"] = open_positions
 
-                # Recent closed
+                # Recent closed / killed
                 if mode in ("live", "paper"):
                     diag["recent_closed"] = _load_recent_closed(cur, strategy, mode, RECENT_CLOSED_LIMIT)
                     diag["killed_markets"] = _load_killed_markets(cur, strategy, mode, KILLED_MARKETS_LIMIT)
+                    rows_for_buckets = _load_closed_rows_for_buckets(cur, strategy, mode)
+                    worst, best = _load_best_worst_markets_24h(cur, strategy, mode, BEST_WORST_MARKETS_LIMIT)
                 else:
                     diag["recent_closed"] = _load_recent_closed(cur, strategy, "live", RECENT_CLOSED_LIMIT)
                     diag["killed_markets"] = _load_killed_markets(cur, strategy, "live", KILLED_MARKETS_LIMIT)
-
-                # Buckets
-                if mode in ("live", "paper"):
-                    rows_for_buckets = _load_closed_rows_for_buckets(cur, strategy, mode)
-                else:
                     rows_for_buckets = _load_closed_rows_for_buckets(cur, strategy, "live")
+                    worst, best = _load_best_worst_markets_24h(cur, strategy, "live", BEST_WORST_MARKETS_LIMIT)
 
                 dislo_edges = _bucket_edges(DISLO_BUCKET_MIN, DISLO_BUCKET_MAX, DISLO_BUCKET_STEP)
-                diag["dislo_buckets"] = _make_buckets(
-                    rows_for_buckets,
-                    key_fn=lambda r: r.get("dislocation"),
-                    edges=dislo_edges
-                )
+                diag["dislo_buckets"] = _make_buckets(rows_for_buckets, key_fn=lambda r: r.get("dislocation"), edges=dislo_edges)
 
                 entry_edges = _bucket_edges(ENTRY_BUCKET_MIN, ENTRY_BUCKET_MAX, ENTRY_BUCKET_STEP)
-                diag["entry_buckets"] = _make_buckets(
-                    rows_for_buckets,
-                    key_fn=lambda r: r.get("entry_price"),
-                    edges=entry_edges
-                )
+                diag["entry_buckets"] = _make_buckets(rows_for_buckets, key_fn=lambda r: r.get("entry_price"), edges=entry_edges)
 
-                # Best/Worst markets 24h
-                if mode in ("live", "paper"):
-                    worst, best = _load_best_worst_markets_24h(cur, strategy, mode, BEST_WORST_MARKETS_LIMIT)
-                else:
-                    worst, best = _load_best_worst_markets_24h(cur, strategy, "live", BEST_WORST_MARKETS_LIMIT)
                 diag["worst_markets"] = worst
                 diag["best_markets"] = best
 
             # Command Center
             if view == "command":
+                # Guardrail: keep command view responsive even if a query gets slow
+                try:
+                    cur.execute("SET statement_timeout = '3000ms'")
+                except Exception:
+                    pass
                 limits = _limits_for_mode("paper" if mode == "paper" else "live")
 
                 # last entry / exit times
-                last_entry_ts = None
-                last_exit_ts = None
                 if mode in ("live", "paper"):
                     tbl = _positions_table_for_mode(mode)
                     rr = _safe_fetchone(
@@ -1701,14 +2183,25 @@ def index():
                     "tmux_level": health["tmux"]["status"],
                     "tmux_text": "OK" if health["tmux"]["status"] == "ok" else health["tmux"]["text"],
                     "bots_level": bots_level,
-                    "bots_text": f"sf {_fmt_age(smartflow_age)} - mr_v1 {_fmt_age(mr_v1_age)} - mr_v2 {_fmt_age(mr_v2_age)}",
+                    "bots_text": health["bots"]["text"],
                     "last_entry_text": _fmt_age(last_entry_age),
                     "last_exit_text": _fmt_age(last_exit_age),
                 }
 
-                # daily pnl and 24h winrate for selected mode (use rollups)
+                # daily pnl (selected mode)
                 if mode in ("live", "paper"):
-                    roll = _load_closed_rollups(cur, strategy, mode)
+                    try:
+                        roll = _load_closed_rollups(cur, strategy, mode)
+                    except Exception:
+                        roll = {
+                            "today_pnl": 0,
+                            "pnl_24h": 0,
+                            "pnl_7d": 0,
+                            "total_pnl": 0,
+                            "closed_trades": 0,
+                            "open_trades": 0,
+                            "winrate": None,
+                        }
                 else:
                     l = _load_closed_rollups(cur, strategy, "live")
                     p = _load_closed_rollups(cur, strategy, "paper")
@@ -1736,50 +2229,18 @@ def index():
                     worst_open = Decimal("0")
                 worst_open_level = "ok" if worst_open >= limits["worst_open"] else "bad"
 
-                # global loss streak (live best)
-                streak = 0
-                if mode == "live":
-                    rows = _safe_fetchall(
-                        cur,
-                        """
-                        SELECT pnl
-                        FROM mr_positions
-                        WHERE (%s='all' OR strategy=%s)
-                          AND COALESCE(status,'closed')='closed'
-                          AND pnl IS NOT NULL
-                        ORDER BY exit_ts DESC
-                        LIMIT 50;
-                        """,
-                        (strategy, strategy),
-                    )
-                    for r0 in rows:
-                        pnl = to_dec(r0.get("pnl"))
-                        if pnl is None:
-                            continue
-                        if pnl < 0:
-                            streak += 1
-                        else:
-                            break
+                # global loss streak
+                try:
+                    streak = _load_loss_streak(cur, strategy, mode, lookback=50)
+                except Exception:
+                    streak = 0
                 loss_streak_level = "ok" if streak < limits["max_streak"] else "bad"
 
-                # 24h winrate (live best)
-                trades_24h = 0
-                wins_24h = 0
-                if mode == "live":
-                    w = _safe_fetchone(
-                        cur,
-                        """
-                        SELECT COUNT(*) AS trades, COUNT(*) FILTER (WHERE pnl > 0) AS wins
-                        FROM mr_positions
-                        WHERE (%s='all' OR strategy=%s)
-                          AND COALESCE(status,'closed')='closed'
-                          AND exit_ts >= (NOW() - INTERVAL '24 hours');
-                        """,
-                        (strategy, strategy),
-                    )
-                    trades_24h = int(w.get("trades") or 0)
-                    wins_24h = int(w.get("wins") or 0)
-
+                # 24h winrate
+                try:
+                    trades_24h, wins_24h = _load_24h_wr(cur, strategy, mode)
+                except Exception:
+                    trades_24h, wins_24h = 0, 0
                 winrate_24h = None
                 winrate_level = "na"
                 if trades_24h >= limits["min_trades_24h"]:
@@ -1815,10 +2276,15 @@ def index():
                 }
 
                 cc["perf"] = _load_performance_snapshot(cur, strategy, mode)
-
-                fp = _filters_today_from_log(strategy)
-
-                executed_today = 0
+                try:
+                    # NOTE: log parsing can be very slow on large log files.
+                    # Only compute filters when explicitly requested: &filters=1
+                    fp = {"markets_scanned": 0, "after_filters": 0, "scan_entries": 0, "trades_executed_today": 0, "blocked": {}}
+                    if request.args.get("filters") == "1":
+                        fp = _filters_today_from_log(strategy)
+                except Exception:
+                    fp = {"markets_scanned": 0, "after_filters": 0, "scan_entries": 0, "trades_executed_today": 0, "blocked": {}}
+                # executed today
                 if mode in ("live", "paper"):
                     tbl = _positions_table_for_mode(mode)
                     rr = _safe_fetchone(
@@ -1870,62 +2336,81 @@ def index():
                     if not flags:
                         continue
 
-                    problems.append({
-                        "age_h": float(age_h),
-                        "market_name": op.get("market_name") or op.get("market_id"),
-                        "tags": op.get("market_tags") or "",
-                        "entry_px": float(entry),
-                        "last_px": float(last),
-                        "dislo_pct": float(dislo * 100),
-                        "unreal": float(unreal),
-                        "flag": " + ".join(flags),
-                    })
-                cc["problems"] = sorted(problems, key=lambda x: (x["unreal"], -x["age_h"]))[:10]
-
-                if mode == "live":
-                    rows = _safe_fetchall(
-                        cur,
-                        """
-                        SELECT
-                          p.market_id,
-                          COALESCE(m.question, p.market_id) AS market_name,
-                          COUNT(*) AS trades,
-                          COALESCE(SUM(p.pnl), 0) AS sum_pnl,
-                          AVG(CASE WHEN p.pnl > 0 THEN 1.0 ELSE 0.0 END) AS winrate,
-                          MAX(p.exit_ts) AS last_exit_ts
-                        FROM mr_positions p
-                        LEFT JOIN markets m ON m.market_id = p.market_id
-                        WHERE (%s = 'all' OR p.strategy = %s)
-                          AND p.status='closed'
-                          AND p.exit_ts IS NOT NULL
-                        GROUP BY p.market_id, market_name
-                        HAVING COUNT(*) >= %s;
-                        """,
-                        (strategy, strategy, DASH_MIN_TRADES_REVIEW),
-                    )
-                    review = []
-                    top = []
-                    for r0 in rows:
-                        trades = int(r0.get("trades") or 0)
-                        sum_pnl = to_dec(r0.get("sum_pnl")) or Decimal("0")
-                        winrate = float(r0.get("winrate") or 0.0)
-                        last_exit_ts = r0.get("last_exit_ts")
-                        last_age = _fmt_age(_age_from_ts(last_exit_ts))
-
-                        item = {
-                            "market_name": r0.get("market_name") or r0.get("market_id"),
-                            "trades": trades,
-                            "sum_pnl": float(sum_pnl),
-                            "winrate": winrate,
-                            "last_age": last_age,
+                    problems.append(
+                        {
+                            "age_h": float(age_h),
+                            "market_name": op.get("market_name") or op.get("market_id"),
+                            "tags": op.get("market_tags") or "",
+                            "entry_px": float(entry),
+                            "last_px": float(last),
+                            "dislo_pct": float(dislo * 100),
+                            "unreal": float(unreal),
+                            "flag": " + ".join(flags),
                         }
-                        if sum_pnl <= DASH_REVIEW_PNL_THRESHOLD or Decimal(str(winrate)) <= DASH_REVIEW_WR_THRESHOLD:
-                            review.append(item)
-                        if sum_pnl >= DASH_TOP_PNL_THRESHOLD:
-                            top.append(item)
+                    )
+                cc["problems"] = sorted(problems, key=lambda x: (x["unreal"], -x["age_h"]))[:10]
+                # market intel (only for live/paper - keep it fast)
+                if mode in ("live", "paper"):
+                    try:
+                        tbl = _positions_table_for_mode(mode)
 
-                    cc["intel"]["review"] = sorted(review, key=lambda x: x["sum_pnl"])[:5]
-                    cc["intel"]["top"] = sorted(top, key=lambda x: x["sum_pnl"], reverse=True)[:5]
+                        # Bound work: only look at most recent closed rows
+                        rows = _safe_fetchall(
+                            cur,
+                            f"""
+                            WITH recent AS (
+                              SELECT *
+                              FROM {tbl}
+                              WHERE (%s = 'all' OR strategy = %s)
+                                AND status='closed'
+                                AND exit_ts IS NOT NULL
+                              ORDER BY exit_ts DESC
+                              LIMIT 5000
+                            )
+                            SELECT
+                              p.market_id,
+                              COALESCE(m.question, p.market_id) AS market_name,
+                              COUNT(*) AS trades,
+                              COALESCE(SUM(p.pnl), 0) AS sum_pnl,
+                              AVG(CASE WHEN p.pnl > 0 THEN 1.0 ELSE 0.0 END) AS winrate,
+                              MAX(p.exit_ts) AS last_exit_ts
+                            FROM recent p
+                            LEFT JOIN markets m ON m.market_id = p.market_id
+                            GROUP BY p.market_id, market_name
+                            HAVING COUNT(*) >= %s;
+                            """,
+                            (strategy, strategy, DASH_MIN_TRADES_REVIEW),
+                        )
+
+                        review = []
+                        top = []
+                        for r0 in rows:
+                            trades = int(r0.get("trades") or 0)
+                            sum_pnl = to_dec(r0.get("sum_pnl")) or Decimal("0")
+                            winrate = float(r0.get("winrate") or 0.0)
+                            last_exit_ts = r0.get("last_exit_ts")
+                            last_age = _fmt_age(_age_from_ts(last_exit_ts))
+
+                            item = {
+                                "market_name": r0.get("market_name") or r0.get("market_id"),
+                                "trades": trades,
+                                "sum_pnl": float(sum_pnl),
+                                "winrate": winrate,
+                                "last_age": last_age,
+                            }
+                            if sum_pnl <= DASH_REVIEW_PNL_THRESHOLD or Decimal(str(winrate)) <= DASH_REVIEW_WR_THRESHOLD:
+                                review.append(item)
+                            if sum_pnl >= DASH_TOP_PNL_THRESHOLD:
+                                top.append(item)
+
+                        cc["intel"]["review"] = sorted(review, key=lambda x: x["sum_pnl"])[:5]
+                        cc["intel"]["top"] = sorted(top, key=lambda x: x["sum_pnl"], reverse=True)[:5]
+                    except Exception:
+                        cc["intel"]["review"] = []
+                        cc["intel"]["top"] = []
+                else:
+                    cc["intel"]["review"] = []
+                    cc["intel"]["top"] = []
 
     except Exception as e:
         health["db"] = {"status": "bad", "text": "FAILED"}
@@ -1933,6 +2418,7 @@ def index():
         health["ingest"] = {"status": "na", "text": "unknown"}
         health["bots"] = {"status": "na", "text": "na"}
         page_error = str(e)
+        live_orders = []
 
     if health["tmux"]["status"] == "bad":
         health["bots"] = {"status": "bad", "text": "tmux missing sessions"}
@@ -1951,8 +2437,9 @@ def index():
         page_error=page_error,
         cc=cc,
         diag=diag,
+        live_orders=live_orders,
     )
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.getenv("DASH_PORT", "5002")), debug=False)
+    app.run(host="127.0.0.1", port=int(os.getenv("DASH_PORT", "5002")), debug=False, threaded=True)

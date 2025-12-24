@@ -15,6 +15,9 @@ EXEC_STRATEGY = os.getenv("MR_STRATEGY", "mean_reversion_v1")
 POLL_SECS = float(os.getenv("MR_INTENT_POLL_SECS", "2.0"))
 BATCH = int(os.getenv("MR_INTENT_BATCH", "25"))
 
+# Live safety: hard cap per order notional (USD)
+LIVE_MAX_ORDER_USD = Decimal(os.getenv("MR_LIVE_MAX_ORDER_USD", "2"))
+
 # Safety gate: refuse unless explicitly enabled
 LIVE_FLAG = os.getenv("MR_LIVE_EXECUTION", "").strip().lower()
 LIVE_ENABLED = LIVE_FLAG in ("1", "true", "yes", "y", "on")
@@ -80,6 +83,9 @@ def main():
                     outcome = it["outcome"]
                     limit_px = dec(it["entry_price"])
                     size_usd = dec(it["size_usd"])
+                    if LIVE_MAX_ORDER_USD > 0 and size_usd > LIVE_MAX_ORDER_USD:
+                        size_usd = LIVE_MAX_ORDER_USD
+
                     dislo = it.get("dislocation")
 
                     if limit_px <= 0:
@@ -101,6 +107,41 @@ def main():
                             (intent_id,),
                         )
                         print(f"[intent2orders_live] intent={intent_id} -> error bad_size")
+                        continue
+
+                    # --------------------------------------------------
+                    # DEDUPE GUARD (live buys)
+                    # Prevent multiple live/submitted buys for same
+                    # market+outcome.
+                    # --------------------------------------------------
+                    cur.execute(
+                        """
+                        SELECT 1
+                        FROM strategy_orders
+                        WHERE paper=false
+                          AND strategy=%s
+                          AND market_id=%s
+                          AND outcome=%s
+                          AND side='buy'
+                          AND status IN ('submitted','live','matched')
+                        LIMIT 1;
+                        """,
+                        (EXEC_STRATEGY, market_id, int(outcome)),
+                    )
+                    if cur.fetchone() is not None:
+                        cur.execute(
+                            """
+                            UPDATE mr_trade_intents
+                            SET status='skipped',
+                                note='dedupe_existing_order'
+                            WHERE id=%s
+                            """,
+                            (intent_id,),
+                        )
+                        print(
+                            f"[intent2orders_live] intent={intent_id} -> skipped dedupe_existing_order "
+                            f"market={market_id} outcome={outcome}"
+                        )
                         continue
 
                     metadata = {

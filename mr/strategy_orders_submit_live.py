@@ -91,7 +91,8 @@ def main():
                         FROM strategy_orders so2
                         WHERE so2.paper = false
                           AND so2.market_id = so.market_id
-                          AND so2.status IN ('live','matched')
+                          AND so2.side = so.side
+                          AND so2.status IN ('live')
                       )
                     )
                     AND NOT EXISTS (
@@ -99,7 +100,8 @@ def main():
                       FROM strategy_orders so3
                       WHERE so3.paper = false
                         AND so3.market_id = so.market_id
-                        AND so3.status IN ('live','matched')
+                        AND so3.side = so.side
+                        AND so3.status IN ('live')
                         AND (
                           (so3.metadata ? 'post_ts')
                           AND (extract(epoch from now()) - (so3.metadata->>'post_ts')::double precision) < %s

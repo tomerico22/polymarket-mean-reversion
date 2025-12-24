@@ -1,28 +1,24 @@
 # secrets
 .env
-*.env
+.env.*
 *.key
-*.pem
 
-# venv / python cache
-.venv/
-venv/
+# python
 __pycache__/
 *.pyc
+.venv/
 
-# logs / runtime
+# logs
 logs/
 *.log
 
-# local config (keep only templates if needed)
-config/
-mr/config/
-*.local
+# tmux
+*.tmux
 
-# OS/editor
-.DS_Store
-.vscode/
-.idea/
+# backups
+*.bak.*
+backups/
 
-# local backups
-*.bak*
+# local db / temp
+*.sqlite
+.tmp/

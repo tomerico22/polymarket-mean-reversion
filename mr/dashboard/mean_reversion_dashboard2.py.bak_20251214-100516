@@ -1,0 +1,1135 @@
+import os
+import subprocess
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+from flask import Flask, render_template_string, request
+from psycopg import connect
+from psycopg.rows import dict_row
+
+DB_URL = os.getenv("DB_URL")
+if not DB_URL:
+    raise SystemExit("DB_URL not set")
+
+app = Flask(__name__)
+
+REFRESH_SECS = 30
+
+# ----------------------------
+# Health thresholds (seconds)
+# ----------------------------
+INGEST_STALE_SECS = int(os.getenv("DASH_INGEST_STALE_SECS", "120"))
+
+BOT_OK_SECS = int(os.getenv("DASH_BOT_OK_SECS", "180"))
+BOT_WARN_SECS = int(os.getenv("DASH_BOT_WARN_SECS", "600"))
+
+LOG_MR_V1 = Path(os.getenv("DASH_LOG_MR_V1", "/root/polymarket-mean-reversion/logs/mr_v1.log"))
+LOG_MR_V2 = Path(os.getenv("DASH_LOG_MR_V2", "/root/polymarket-mean-reversion/logs/mr_v2.log"))
+
+DASH_ENABLE_MR_V2 = os.getenv("DASH_ENABLE_MR_V2","1") == "1"
+if not DASH_ENABLE_MR_V2:
+    LOG_MR_V2 = None
+
+# tmux sessions we expect
+EXPECTED_TMUX_SESSIONS = [s.strip() for s in os.getenv("DASH_TMUX_SESSIONS","mr_v1,elwa_smartflow_full").split(",") if s.strip()]
+
+# available strategy filters
+STRATEGIES = [
+    "mean_reversion_v1",
+    "mean_reversion_v3_32",
+    "mean_reversion_strict_v1",
+    "mean_reversion_v2",
+    "all",
+]
+
+MODES = ["live", "paper", "both"]
+
+# ----------------------------
+# Kill switch thresholds
+# Looser for paper (your choice)
+# ----------------------------
+# Live defaults
+LIVE_DAILY_LOSS_LIMIT_USD = Decimal(os.getenv("DASH_DAILY_LOSS_LIMIT_USD", "-200"))
+LIVE_WORST_OPEN_LIMIT_USD = Decimal(os.getenv("DASH_WORST_OPEN_LIMIT_USD", "-50"))
+LIVE_MAX_GLOBAL_LOSS_STREAK = int(os.getenv("DASH_MAX_GLOBAL_LOSS_STREAK", "5"))
+LIVE_MIN_TRADES_24H = int(os.getenv("DASH_MIN_TRADES_24H", "10"))
+LIVE_WINRATE_FLOOR_24H = Decimal(os.getenv("DASH_WINRATE_FLOOR_24H", "0.45"))
+
+# Paper defaults (looser)
+PAPER_DAILY_LOSS_LIMIT_USD = Decimal(os.getenv("DASH_PAPER_DAILY_LOSS_LIMIT_USD", "-500"))
+PAPER_WORST_OPEN_LIMIT_USD = Decimal(os.getenv("DASH_PAPER_WORST_OPEN_LIMIT_USD", "-150"))
+PAPER_MAX_GLOBAL_LOSS_STREAK = int(os.getenv("DASH_PAPER_MAX_GLOBAL_LOSS_STREAK", "8"))
+PAPER_MIN_TRADES_24H = int(os.getenv("DASH_PAPER_MIN_TRADES_24H", "10"))
+PAPER_WINRATE_FLOOR_24H = Decimal(os.getenv("DASH_PAPER_WINRATE_FLOOR_24H", "0.40"))
+
+# Problem position flags
+DASH_PROBLEM_AGE_HOURS = Decimal(os.getenv("DASH_PROBLEM_AGE_HOURS", "8"))
+DASH_PROBLEM_UNREAL_USD = Decimal(os.getenv("DASH_PROBLEM_UNREAL_USD", "-15"))
+DASH_PROBLEM_UNREAL_PCT = Decimal(os.getenv("DASH_PROBLEM_UNREAL_PCT", "-10"))
+
+# Market intel thresholds
+DASH_MIN_TRADES_REVIEW = int(os.getenv("DASH_MIN_TRADES_REVIEW", "5"))
+DASH_REVIEW_PNL_THRESHOLD = Decimal(os.getenv("DASH_REVIEW_PNL_THRESHOLD", "-50"))
+DASH_REVIEW_WR_THRESHOLD = Decimal(os.getenv("DASH_REVIEW_WR_THRESHOLD", "0.35"))
+DASH_TOP_PNL_THRESHOLD = Decimal(os.getenv("DASH_TOP_PNL_THRESHOLD", "100"))
+
+HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Mean Reversion Dashboard</title>
+  <meta http-equiv="refresh" content="{{ refresh_secs }}">
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; margin: 20px; background:#111; color:#eee; }
+    h1 { font-size: 1.6rem; margin: 0.2rem 0; }
+    h2 { font-size: 1.15rem; margin: 1.1rem 0 0.4rem 0; }
+    h3 { font-size: 0.95rem; margin: 0.8rem 0 0.35rem 0; color:#ddd; }
+    .small { font-size:0.75rem; color:#aaa; }
+    .muted { color:#999; }
+
+    .toolbar { margin:0.6rem 0 0.8rem 0; display:flex; gap:1rem; align-items:center; flex-wrap:wrap; }
+    .toolbar label { margin-right:0.4rem; }
+    select { background:#1d1d1d; color:#eee; border:1px solid #333; border-radius:10px; padding:0.35rem 0.55rem; }
+
+    a.tab { background:#1d1d1d; color:#eee; border:1px solid #333; border-radius:10px; padding:0.35rem 0.55rem; text-decoration:none; }
+    a.tab.active { border-color:#32cd32; }
+
+    .healthbar { display:flex; gap:0.6rem; flex-wrap:wrap; margin:0.8rem 0 1rem 0; }
+    .pill { display:flex; align-items:center; gap:0.5rem; padding:0.35rem 0.6rem; border-radius:999px; border:1px solid #333; background:#1a1a1a; }
+    .dot { width:10px; height:10px; border-radius:50%; background:#666; }
+    .pill .label { font-size:0.72rem; color:#bbb; text-transform:uppercase; letter-spacing:0.02em; }
+    .pill .value { font-size:0.8rem; color:#eee; }
+    .ok .dot { background:#32cd32; }
+    .warn .dot { background:#ffd24d; }
+    .bad .dot { background:#ff4d4d; }
+    .na .dot { background:#666; }
+    .pill.bad { border-color:#4a2020; }
+    .pill.warn { border-color:#4a3b20; }
+    .pill.ok { border-color:#244a24; }
+    .pill.na { border-color:#333; }
+
+    .summary { display:flex; gap:1rem; flex-wrap:wrap; margin:0.8rem 0 0.8rem 0; }
+    .card { background:#1d1d1d; padding:0.8rem 1rem; border-radius:10px; min-width:10rem; border:1px solid #2a2a2a; }
+    .card-label { font-size:0.7rem; text-transform:uppercase; color:#aaa; margin-bottom:0.25rem; letter-spacing:0.02em; }
+    .card-value { font-size:1.1rem; font-weight:700; }
+
+    .pnl-pos { color:#32cd32; font-weight:700; }
+    .pnl-neg { color:#ff4d4d; font-weight:700; }
+    .warn-txt { color:#ffd24d; font-weight:700; }
+
+    table { border-collapse:collapse; width:100%; margin-top:0.5rem; font-size:0.82rem; }
+    th, td { border:1px solid #333; padding:0.35rem 0.55rem; text-align:left; vertical-align:top; }
+    th { background:#222; position:sticky; top:0; }
+    tr:nth-child(even) { background:#181818; }
+    tr:nth-child(odd) { background:#151515; }
+
+    .strip { background:#151515; border:1px solid #2a2a2a; border-radius:10px; padding:0.6rem 0.75rem; margin:0.6rem 0; }
+    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:1rem; }
+    @media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
+
+    .errorbox { margin-top: 1rem; padding: 0.8rem 1rem; background:#1d1d1d; border:1px solid #4a2020; border-radius:10px; color:#ffb3b3; }
+  </style>
+  <script>
+    const refreshSecs = {{ refresh_secs }};
+    let remaining = refreshSecs;
+    function tick() {
+      const el = document.getElementById("refresh_left");
+      if (el) el.textContent = remaining;
+      remaining = remaining > 0 ? remaining - 1 : 0;
+    }
+    document.addEventListener("DOMContentLoaded", () => {
+      tick();
+      setInterval(tick, 1000);
+    });
+  </script>
+</head>
+<body>
+  <h1>Mean Reversion Dashboard</h1>
+
+  <div class="small">
+    DB: {{ db_url_short }} - Updated at {{ now_utc }} - Strategy: <strong>{{ strategy }}</strong> - Mode: <strong>{{ mode }}</strong> -
+    Refresh every {{ refresh_secs }}s (in <span id="refresh_left">{{ refresh_secs }}</span>s)
+  </div>
+
+  <div class="toolbar">
+    <div>
+      <a class="tab {% if view == 'command' %}active{% endif %}" href="/?view=command&strategy={{ strategy }}&mode={{ mode }}">Command Center</a>
+      <a class="tab {% if view != 'command' %}active{% endif %}" href="/?view=diagnostics&strategy={{ strategy }}&mode={{ mode }}">Diagnostics</a>
+    </div>
+
+    <form method="get">
+      <input type="hidden" name="view" value="{{ view }}">
+      <label for="strategy" class="small">Strategy:</label>
+      <select id="strategy" name="strategy" onchange="this.form.submit()">
+        {% for s in strategies %}
+          <option value="{{ s }}" {% if s == strategy %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+
+      <label for="mode" class="small">Mode:</label>
+      <select id="mode" name="mode" onchange="this.form.submit()">
+        {% for m in modes %}
+          <option value="{{ m }}" {% if m == mode %}selected{% endif %}>{{ m }}</option>
+        {% endfor %}
+      </select>
+    </form>
+  </div>
+
+  {% if page_error %}
+    <div class="errorbox">
+      Error loading data: {{ page_error }}
+    </div>
+  {% endif %}
+
+  {% if view == 'command' %}
+
+    <div class="strip">
+      <strong>Status:</strong>
+      DB:
+      <span class="{% if cc.status.db_level == 'ok' %}pnl-pos{% elif cc.status.db_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.db_text }}</span>
+      |
+      Ingest:
+      <span class="{% if cc.status.ingest_level == 'ok' %}pnl-pos{% elif cc.status.ingest_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.ingest_text }}</span>
+      |
+      tmux:
+      <span class="{% if cc.status.tmux_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.status.tmux_text }}</span>
+      |
+      Bots:
+      <span class="{% if cc.status.bots_level == 'ok' %}pnl-pos{% elif cc.status.bots_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">{{ cc.status.bots_text }}</span>
+      |
+      Last MR action: <span class="muted">{{ cc.status.last_mr_action_text }}</span>
+      |
+      Signals (10m): <span class="muted">{{ cc.status.signals_10m }}</span>
+    </div>
+
+    <h2>Kill Switch Monitor</h2>
+    <table>
+      <thead>
+        <tr><th>Metric</th><th>Current</th><th>Limit</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Daily PnL</td>
+          <td class="{% if cc.kill.daily_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.kill.daily_pnl) }}</td>
+          <td>{{ "%.2f"|format(cc.kill.daily_limit) }}</td>
+          <td class="{% if cc.kill.daily_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.kill.daily_level|upper }}</td>
+        </tr>
+        <tr>
+          <td>Worst Open Unrealized</td>
+          <td class="{% if cc.kill.worst_open < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.kill.worst_open) }}</td>
+          <td>{{ "%.2f"|format(cc.kill.worst_open_limit) }}</td>
+          <td class="{% if cc.kill.worst_open_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.kill.worst_open_level|upper }}</td>
+        </tr>
+        <tr>
+          <td>Global Loss Streak</td>
+          <td>{{ cc.kill.loss_streak }}</td>
+          <td>{{ cc.kill.loss_streak_limit }}</td>
+          <td class="{% if cc.kill.loss_streak_level == 'ok' %}pnl-pos{% else %}pnl-neg{% endif %}">{{ cc.kill.loss_streak_level|upper }}</td>
+        </tr>
+        <tr>
+          <td>Winrate (24h)</td>
+          <td>
+            {% if cc.kill.winrate_24h is none %}
+              <span class="muted">na ({{ cc.kill.trades_24h }} trades)</span>
+            {% else %}
+              {{ "%.1f"|format(cc.kill.winrate_24h * 100) }}% ({{ cc.kill.trades_24h }} trades)
+            {% endif %}
+          </td>
+          <td>{{ "%.1f"|format(cc.kill.winrate_floor * 100) }}% (min {{ cc.kill.min_trades_24h }})</td>
+          <td class="{% if cc.kill.winrate_level == 'ok' %}pnl-pos{% elif cc.kill.winrate_level == 'na' %}muted{% else %}warn-txt{% endif %}">
+            {{ cc.kill.winrate_level|upper }}
+          </td>
+        </tr>
+        <tr>
+          <td><strong>SYSTEM STATUS</strong></td>
+          <td colspan="3" class="{% if cc.kill.system_level == 'ok' %}pnl-pos{% elif cc.kill.system_level == 'warn' %}warn-txt{% else %}pnl-neg{% endif %}">
+            <strong>{{ cc.kill.system_level|upper }}</strong>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Pulse</h2>
+    <div class="summary">
+      <div class="card">
+        <div class="card-label">Today PnL</div>
+        <div class="card-value {% if cc.pulse.today_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.pulse.today_pnl) }}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">24h PnL</div>
+        <div class="card-value {% if cc.pulse.pnl_24h < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.pulse.pnl_24h) }}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">7d PnL</div>
+        <div class="card-value {% if cc.pulse.pnl_7d < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(cc.pulse.pnl_7d) }}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Winrate (24h)</div>
+        <div class="card-value">
+          {% if cc.pulse.winrate_24h is none %}
+            <span class="muted">na</span>
+          {% else %}
+            {{ "%.1f"|format(cc.pulse.winrate_24h * 100) }}%
+          {% endif %}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Open Positions</div>
+        <div class="card-value">{{ cc.pulse.open_count }}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Capital at Risk</div>
+        <div class="card-value">{{ "%.2f"|format(cc.pulse.capital_at_risk) }}</div>
+      </div>
+    </div>
+
+    <h2>Problem Positions</h2>
+    {% if cc.problems %}
+    <table>
+      <thead>
+        <tr>
+          <th>Age (h)</th>
+          <th>Market</th>
+          <th>Tags</th>
+          <th>Entry - Last</th>
+          <th>Dislo%</th>
+          <th>Unrealized</th>
+          <th>Flag</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in cc.problems %}
+        <tr>
+          <td>{{ "%.1f"|format(p.age_h) }}</td>
+          <td class="small">{{ p.market_name }}</td>
+          <td class="small">{{ p.tags }}</td>
+          <td>{{ "%.4f"|format(p.entry_px) }} - {{ "%.4f"|format(p.last_px) }}</td>
+          <td>{{ "%.1f"|format(p.dislo_pct) }}</td>
+          <td class="{% if p.unreal < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">{{ "%.2f"|format(p.unreal) }}</td>
+          <td class="{% if 'UNDERWATER' in p.flag or 'OLD' in p.flag %}warn-txt{% else %}muted{% endif %}">{{ p.flag }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <div class="small muted">No problem positions (or not available in this mode).</div>
+    {% endif %}
+
+    <h2>Market Intelligence</h2>
+    <div class="grid2">
+      <div>
+        <h3>Review Candidates</h3>
+        {% if cc.intel.review %}
+        <table>
+          <thead><tr><th>Market</th><th>Trades</th><th>Sum PnL</th><th>WR</th><th>Last</th></tr></thead>
+          <tbody>
+            {% for r in cc.intel.review %}
+            <tr>
+              <td class="small">{{ r.market_name }}</td>
+              <td>{{ r.trades }}</td>
+              <td class="pnl-neg">{{ "%.2f"|format(r.sum_pnl) }}</td>
+              <td>{{ "%.0f"|format(r.winrate * 100) }}%</td>
+              <td class="muted">{{ r.last_age }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <div class="small muted">na</div>
+        {% endif %}
+      </div>
+
+      <div>
+        <h3>Top Performers</h3>
+        {% if cc.intel.top %}
+        <table>
+          <thead><tr><th>Market</th><th>Trades</th><th>Sum PnL</th><th>WR</th><th>Last</th></tr></thead>
+          <tbody>
+            {% for r in cc.intel.top %}
+            <tr>
+              <td class="small">{{ r.market_name }}</td>
+              <td>{{ r.trades }}</td>
+              <td class="pnl-pos">{{ "%.2f"|format(r.sum_pnl) }}</td>
+              <td>{{ "%.0f"|format(r.winrate * 100) }}%</td>
+              <td class="muted">{{ r.last_age }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <div class="small muted">na</div>
+        {% endif %}
+      </div>
+    </div>
+
+  {% else %}
+
+    <div class="healthbar">
+      <div class="pill {{ health.db.status }}">
+        <span class="dot"></span>
+        <span class="label">DB</span>
+        <span class="value">{{ health.db.text }}</span>
+      </div>
+
+      <div class="pill {{ health.ingest.status }}">
+        <span class="dot"></span>
+        <span class="label">Ingest</span>
+        <span class="value">{{ health.ingest.text }}</span>
+      </div>
+
+      <div class="pill {{ health.tmux.status }}">
+        <span class="dot"></span>
+        <span class="label">tmux</span>
+        <span class="value">{{ health.tmux.text }}</span>
+      </div>
+
+      <div class="pill {{ health.bots.status }}">
+        <span class="dot"></span>
+        <span class="label">Bots</span>
+        <span class="value">{{ health.bots.text }}</span>
+      </div>
+
+      <div class="pill {{ health.dashboard.status }}">
+        <span class="dot"></span>
+        <span class="label">Dashboard</span>
+        <span class="value">{{ health.dashboard.text }}</span>
+      </div>
+    </div>
+
+    <div class="summary">
+      <div class="card">
+        <div class="card-label">Closed PnL (Today)</div>
+        <div class="card-value {% if diag.today_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
+          {{ "%.2f"|format(diag.today_pnl) }}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Closed PnL (All)</div>
+        <div class="card-value {% if diag.total_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
+          {{ "%.2f"|format(diag.total_pnl) }}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Trades (closed)</div>
+        <div class="card-value">{{ diag.closed_trades }}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Trades (open)</div>
+        <div class="card-value">{{ diag.open_trades }}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Winrate (all)</div>
+        <div class="card-value">
+          {% if diag.winrate is none %}<span class="muted">na</span>{% else %}{{ "%.1f"|format(diag.winrate * 100) }}%{% endif %}
+        </div>
+      </div>
+    </div>
+
+    <h2>Open Positions</h2>
+    {% if diag.open_positions %}
+    <table>
+      <thead>
+        <tr>
+          <th>Entry TS</th>
+          <th>Market</th>
+          <th>Name</th>
+          <th>Tags</th>
+          <th>Outcome</th>
+          <th>Dislo%</th>
+          <th>Size</th>
+          <th>Entry Px</th>
+          <th>Cost</th>
+          <th>Last Px</th>
+          <th>Px %</th>
+          <th>Unrealized</th>
+          <th>Hours</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in diag.open_positions %}
+        <tr>
+          <td>{{ p.entry_ts }}</td>
+          <td class="small">{{ p.market_id[:16] }}…</td>
+          <td class="small">{{ p.market_name or '' }}</td>
+          <td class="small">{{ p.market_tags or '' }}</td>
+          <td>{{ p.outcome_label }}</td>
+          <td>{{ "%.1f"|format(p.dislocation * 100 if p.dislocation is not none else 0) }}</td>
+          <td>{{ "%.2f"|format(p.size or 0) }}</td>
+          <td>{{ "%.4f"|format(p.entry_price or 0) }}</td>
+          <td>{{ "%.2f"|format(p.cost or 0) }}</td>
+          <td>{{ "%.4f"|format(p.last_price or 0) }}</td>
+          <td class="{% if p.px_change_pct < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
+            {{ "%.1f"|format(p.px_change_pct or 0) }}%
+          </td>
+          <td class="{% if p.unrealized_pnl < 0 %}pnl-neg{% else %}pnl-pos{% endif %}">
+            {{ "%.2f"|format(p.unrealized_pnl) }}
+          </td>
+          <td>{{ "%.1f"|format(p.hours_open) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <div class="small muted">No open positions (or not available in this mode).</div>
+    {% endif %}
+
+  {% endif %}
+
+</body>
+</html>
+"""
+
+
+def to_dec(x):
+    if x is None:
+        return None
+    try:
+        return Decimal(str(x))
+    except Exception:
+        return None
+
+
+def get_conn():
+    return connect(DB_URL, row_factory=dict_row)
+
+
+def _run(cmd, timeout=2):
+    try:
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip()
+    except Exception as e:
+        return 999, "", str(e)
+
+
+def _file_age_secs(path: Path):
+    try:
+        return max(0, (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime))
+    except Exception:
+        return None
+
+
+def _db_latest_ts(cur, sql, params=()):
+    try:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if not row:
+            return None
+        return row.get("ts") if isinstance(row, dict) else row[0]
+    except Exception:
+        return None
+
+
+def _age_from_ts(ts):
+    if not ts:
+        return None
+    try:
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return None
+
+
+def _bot_level(age_s):
+    if age_s is None:
+        return "na"
+    if age_s <= BOT_OK_SECS:
+        return "ok"
+    if age_s <= BOT_WARN_SECS:
+        return "warn"
+    return "bad"
+
+
+def _fmt_age(age_s):
+    if age_s is None:
+        return "na"
+    age_s = int(age_s)
+    if age_s < 60:
+        return f"{age_s}s"
+    m = age_s // 60
+    if m < 60:
+        return f"{m}m"
+    h = m // 60
+    return f"{h}h"
+
+
+def _parse_tags(market_tags):
+    if isinstance(market_tags, list):
+        return [str(t).strip() for t in market_tags if str(t).strip()]
+    if isinstance(market_tags, str):
+        parts = [p.strip() for p in market_tags.split(",")]
+        return [p for p in parts if p]
+    return []
+
+
+def check_tmux_sessions():
+    missing = []
+    for s in EXPECTED_TMUX_SESSIONS:
+        code, _, _ = _run(["tmux", "has-session", "-t", s], timeout=1)
+        if code != 0:
+            missing.append(s)
+    if not missing:
+        return {"status": "ok", "text": "all sessions up"}
+    return {"status": "bad", "text": f"missing: {', '.join(missing)}"}
+
+
+def _safe_fetchall(cur, sql, params=()):
+    try:
+        cur.execute(sql, params)
+        return cur.fetchall()
+    except Exception:
+        return []
+
+
+def _safe_fetchone(cur, sql, params=()):
+    try:
+        cur.execute(sql, params)
+        return cur.fetchone() or {}
+    except Exception:
+        return {}
+
+
+def _positions_table_for_mode(mode):
+    # live uses mr_positions, paper uses paper_positions
+    if mode == "paper":
+        return "paper_positions"
+    return "mr_positions"
+
+
+def _paper_like(mode):
+    return mode == "paper"
+
+
+def _limits_for_mode(mode):
+    if _paper_like(mode):
+        return {
+            "daily_loss": PAPER_DAILY_LOSS_LIMIT_USD,
+            "worst_open": PAPER_WORST_OPEN_LIMIT_USD,
+            "max_streak": PAPER_MAX_GLOBAL_LOSS_STREAK,
+            "min_trades_24h": PAPER_MIN_TRADES_24H,
+            "winrate_floor": PAPER_WINRATE_FLOOR_24H,
+        }
+    return {
+        "daily_loss": LIVE_DAILY_LOSS_LIMIT_USD,
+        "worst_open": LIVE_WORST_OPEN_LIMIT_USD,
+        "max_streak": LIVE_MAX_GLOBAL_LOSS_STREAK,
+        "min_trades_24h": LIVE_MIN_TRADES_24H,
+        "winrate_floor": LIVE_WINRATE_FLOOR_24H,
+    }
+
+
+def _load_open_positions(cur, strategy, mode):
+    tbl = _positions_table_for_mode(mode)
+
+    # Defensive: if paper_positions does not have same columns, this will return [] not crash.
+    sql = f"""
+        SELECT
+          p.*,
+          COALESCE(m.question, p.market_id) AS market_name,
+          m.tags AS market_tags,
+          (SELECT price FROM raw_trades rt
+           WHERE rt.market_id = p.market_id
+             AND rt.outcome = p.outcome
+           ORDER BY rt.ts DESC LIMIT 1) AS last_price
+        FROM {tbl} p
+        LEFT JOIN markets m ON m.market_id = p.market_id
+        WHERE (%s = 'all' OR p.strategy = %s)
+          AND COALESCE(p.status, 'open') = 'open'
+        ORDER BY p.entry_ts DESC;
+    """
+    rows = _safe_fetchall(cur, sql, (strategy, strategy))
+
+    out = []
+    for p in rows:
+        entry = to_dec(p.get("entry_price")) or Decimal("0")
+        last = to_dec(p.get("last_price")) or entry
+        size = to_dec(p.get("size") or 0) or Decimal("0")
+
+        cost = entry * size
+        unreal = (last - entry) * size
+        if str(p.get("side", "")).lower() == "short":
+            unreal = -unreal
+
+        hours_open = 0.0
+        try:
+            hours_open = (datetime.now(timezone.utc) - p.get("entry_ts")).total_seconds() / 3600
+        except Exception:
+            hours_open = 0.0
+
+        o = str(p.get("outcome"))
+        outcome_label = "Yes" if o == "1" else "No"
+
+        market_tags = p.get("market_tags")
+        tags_txt = ", ".join(market_tags) if isinstance(market_tags, list) else (market_tags or "")
+
+        out.append({
+            "entry_ts": p.get("entry_ts"),
+            "market_id": p.get("market_id") or "",
+            "market_name": p.get("market_name") or p.get("market_id") or "",
+            "market_tags": tags_txt,
+            "outcome_label": outcome_label,
+            "dislocation": to_dec(p.get("dislocation")),
+            "size": float(size),
+            "entry_price": float(entry),
+            "cost": float(cost),
+            "last_price": float(last),
+            "px_change_pct": float(((last / entry) - 1) * 100) if entry > 0 else 0.0,
+            "unrealized_pnl": float(unreal),
+            "hours_open": float(hours_open),
+        })
+    return out
+
+
+def _load_closed_rollups(cur, strategy, mode):
+    tbl = _positions_table_for_mode(mode)
+    # daily pnl + overall totals
+    sql = f"""
+        SELECT
+          COALESCE(SUM(pnl) FILTER (WHERE COALESCE(status,'closed')='closed' AND exit_ts >= CURRENT_DATE), 0) AS today_pnl,
+          COALESCE(SUM(pnl) FILTER (WHERE COALESCE(status,'closed')='closed'), 0) AS total_pnl,
+          COUNT(*) FILTER (WHERE COALESCE(status,'closed')='closed') AS closed_trades,
+          COUNT(*) FILTER (WHERE COALESCE(status,'open')='open') AS open_trades,
+          COUNT(*) FILTER (WHERE COALESCE(status,'closed')='closed' AND pnl > 0) AS winners
+        FROM {tbl}
+        WHERE (%s = 'all' OR strategy = %s);
+    """
+    r = _safe_fetchone(cur, sql, (strategy, strategy))
+    closed = int(r.get("closed_trades") or 0)
+    winners = int(r.get("winners") or 0)
+    winrate = (winners / closed) if closed else None
+    return {
+        "today_pnl": float(to_dec(r.get("today_pnl")) or 0),
+        "total_pnl": float(to_dec(r.get("total_pnl")) or 0),
+        "closed_trades": closed,
+        "open_trades": int(r.get("open_trades") or 0),
+        "winrate": winrate,
+    }
+
+
+@app.route("/")
+def index():
+    view = request.args.get("view", "diagnostics")
+    if view not in ("command", "diagnostics"):
+        view = "diagnostics"
+
+    strategy = request.args.get("strategy", "mean_reversion_v1")
+    if strategy not in STRATEGIES:
+        strategy = "mean_reversion_v1"
+
+    mode = request.args.get("mode", "live")
+    if mode not in MODES:
+        mode = "live"
+
+    now_dt = datetime.now(timezone.utc)
+    now_utc = now_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    db_url_short = DB_URL.split("@")[-1] if "@" in DB_URL else DB_URL
+
+    page_error = None
+
+    health = {
+        "db": {"status": "na", "text": "unknown"},
+        "ingest": {"status": "na", "text": "unknown"},
+        "tmux": check_tmux_sessions(),
+        "bots": {"status": "na", "text": "na"},
+        "dashboard": {"status": "ok", "text": "serving"},
+    }
+
+    cc = {
+        "status": {},
+        "kill": {},
+        "pulse": {},
+        "problems": [],
+        "intel": {"review": [], "top": []},
+    }
+
+    diag = {
+        "today_pnl": 0.0,
+        "total_pnl": 0.0,
+        "closed_trades": 0,
+        "open_trades": 0,
+        "winrate": None,
+        "open_positions": [],
+    }
+
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            # DB ping
+            _ = _safe_fetchone(cur, "SELECT 1 AS ok;")
+            health["db"] = {"status": "ok", "text": "connected"}
+
+            # Ingest freshness
+            r = _safe_fetchone(cur, "SELECT MAX(ts) AS max_ts FROM raw_trades;")
+            max_ts = r.get("max_ts")
+            ingest_lag = None
+            if max_ts:
+                ingest_lag = (now_dt - max_ts).total_seconds()
+                if ingest_lag <= INGEST_STALE_SECS:
+                    health["ingest"] = {"status": "ok", "text": f"fresh ({int(ingest_lag)}s lag)"}
+                else:
+                    health["ingest"] = {"status": "warn", "text": f"stale ({int(ingest_lag)}s lag)"}
+            else:
+                health["ingest"] = {"status": "bad", "text": "no trades yet"}
+
+            # Activity based bots health
+            latest_flow_ts = _db_latest_ts(cur, "SELECT MAX(ts) AS ts FROM flow_snapshots;")
+            smartflow_age = _age_from_ts(latest_flow_ts)
+            mr_v1_age = _file_age_secs(LOG_MR_V1)
+            mr_v2_age = (_file_age_secs(LOG_MR_V2) if LOG_MR_V2 else None)
+
+            levels = [_bot_level(smartflow_age), _bot_level(mr_v1_age), _bot_level(mr_v2_age)]
+            if "bad" in levels:
+                bots_level = "bad"
+            elif "warn" in levels or "na" in levels:
+                bots_level = "warn"
+            else:
+                bots_level = "ok"
+            health["bots"] = {"status": bots_level, "text": f"sf {_fmt_age(smartflow_age)} - mr_v1 {_fmt_age(mr_v1_age)} - mr_v2 {_fmt_age(mr_v2_age)}"}
+
+            # Load open positions for selected mode
+            if mode in ("live", "paper"):
+                open_positions = _load_open_positions(cur, strategy, mode)
+            else:
+                # both: merge (best effort)
+                live_open = _load_open_positions(cur, strategy, "live")
+                paper_open = _load_open_positions(cur, strategy, "paper")
+                open_positions = live_open + paper_open
+
+            # Diagnostics rollup (selected mode)
+            if view != "command":
+                if mode in ("live", "paper"):
+                    diag_roll = _load_closed_rollups(cur, strategy, mode)
+                else:
+                    # both: sum live + paper
+                    l = _load_closed_rollups(cur, strategy, "live")
+                    p = _load_closed_rollups(cur, strategy, "paper")
+                    closed_trades = (l["closed_trades"] or 0) + (p["closed_trades"] or 0)
+                    winners = 0
+                    # approximate winners from winrate * closed
+                    if l["winrate"] is not None:
+                        winners += int(round(l["winrate"] * l["closed_trades"]))
+                    if p["winrate"] is not None:
+                        winners += int(round(p["winrate"] * p["closed_trades"]))
+                    winrate = (winners / closed_trades) if closed_trades else None
+                    diag_roll = {
+                        "today_pnl": l["today_pnl"] + p["today_pnl"],
+                        "total_pnl": l["total_pnl"] + p["total_pnl"],
+                        "closed_trades": closed_trades,
+                        "open_trades": (l["open_trades"] or 0) + (p["open_trades"] or 0),
+                        "winrate": winrate,
+                    }
+                diag.update(diag_roll)
+                diag["open_positions"] = open_positions
+
+            # Command Center essentials
+            if view == "command":
+                limits = _limits_for_mode("paper" if mode == "paper" else "live")
+
+                # last MR action (live table only; paper table may not have exit_ts/entry_ts consistently)
+                last_mr_ts = None
+                if mode == "live":
+                    rr = _safe_fetchone(
+                        cur,
+                        """
+                        SELECT GREATEST(MAX(entry_ts), MAX(exit_ts)) AS ts
+                        FROM mr_positions
+                        WHERE (%s = 'all' OR strategy = %s);
+                        """,
+                        (strategy, strategy),
+                    )
+                    last_mr_ts = rr.get("ts")
+                last_mr_age = _age_from_ts(last_mr_ts)
+
+                # signals last 10m (global, strategy filtered if possible)
+                sig = _safe_fetchone(
+                    cur,
+                    "SELECT COUNT(*) AS n FROM strategy_signals WHERE ts >= (NOW() - INTERVAL '10 minutes') AND (%s='all' OR strategy=%s);",
+                    (strategy, strategy),
+                )
+                signals_10m = int(sig.get("n") or 0)
+
+                ingest_level = "bad" if ingest_lag is None else ("ok" if ingest_lag <= INGEST_STALE_SECS else "warn")
+
+                cc["status"] = {
+                    "db_level": "ok",
+                    "db_text": "OK",
+                    "ingest_level": ingest_level,
+                    "ingest_text": "no trades" if ingest_lag is None else f"{int(ingest_lag)}s",
+                    "tmux_level": health["tmux"]["status"],
+                    "tmux_text": "OK" if health["tmux"]["status"] == "ok" else health["tmux"]["text"],
+                    "bots_level": bots_level,
+                    "bots_text": f"sf {_fmt_age(smartflow_age)} - mr_v1 {_fmt_age(mr_v1_age)} - mr_v2 {_fmt_age(mr_v2_age)}",
+                    "last_mr_action_text": _fmt_age(last_mr_age),
+                    "signals_10m": signals_10m,
+                }
+
+                # daily pnl and 24h winrate for selected mode
+                if mode in ("live", "paper"):
+                    roll = _load_closed_rollups(cur, strategy, mode)
+                else:
+                    l = _load_closed_rollups(cur, strategy, "live")
+                    p = _load_closed_rollups(cur, strategy, "paper")
+                    roll = {
+                        "today_pnl": l["today_pnl"] + p["today_pnl"],
+                        "total_pnl": l["total_pnl"] + p["total_pnl"],
+                        "closed_trades": (l["closed_trades"] or 0) + (p["closed_trades"] or 0),
+                        "open_trades": (l["open_trades"] or 0) + (p["open_trades"] or 0),
+                        "winrate": None,
+                    }
+
+                daily_pnl = Decimal(str(roll["today_pnl"]))
+                daily_level = "ok" if daily_pnl >= limits["daily_loss"] else "bad"
+
+                # worst open
+                worst_open = None
+                for op in open_positions:
+                    u = to_dec(op.get("unrealized_pnl"))
+                    if u is None:
+                        continue
+                    worst_open = u if worst_open is None else min(worst_open, u)
+                if worst_open is None:
+                    worst_open = Decimal("0")
+                worst_open_level = "ok" if worst_open >= limits["worst_open"] else "bad"
+
+                # global loss streak from last closed trades (only reliable for live, best effort for paper)
+                streak = 0
+                if mode == "live":
+                    rows = _safe_fetchall(
+                        cur,
+                        """
+                        SELECT pnl
+                        FROM mr_positions
+                        WHERE (%s='all' OR strategy=%s)
+                          AND COALESCE(status,'closed')='closed'
+                          AND pnl IS NOT NULL
+                        ORDER BY exit_ts DESC
+                        LIMIT 50;
+                        """,
+                        (strategy, strategy),
+                    )
+                    for r0 in rows:
+                        pnl = to_dec(r0.get("pnl"))
+                        if pnl is None:
+                            continue
+                        if pnl < 0:
+                            streak += 1
+                        else:
+                            break
+                loss_streak_level = "ok" if streak < limits["max_streak"] else "bad"
+
+                # 24h winrate (live: mr_positions; paper: best effort)
+                trades_24h = 0
+                wins_24h = 0
+                if mode == "live":
+                    w = _safe_fetchone(
+                        cur,
+                        """
+                        SELECT COUNT(*) AS trades, COUNT(*) FILTER (WHERE pnl > 0) AS wins
+                        FROM mr_positions
+                        WHERE (%s='all' OR strategy=%s)
+                          AND COALESCE(status,'closed')='closed'
+                          AND exit_ts >= (NOW() - INTERVAL '24 hours');
+                        """,
+                        (strategy, strategy),
+                    )
+                    trades_24h = int(w.get("trades") or 0)
+                    wins_24h = int(w.get("wins") or 0)
+
+                winrate_24h = None
+                winrate_level = "na"
+                if trades_24h >= limits["min_trades_24h"]:
+                    winrate_24h = float(wins_24h / trades_24h) if trades_24h else None
+                    if winrate_24h is not None and Decimal(str(winrate_24h)) >= limits["winrate_floor"]:
+                        winrate_level = "ok"
+                    else:
+                        winrate_level = "warn"
+
+                if daily_level == "bad" or worst_open_level == "bad" or loss_streak_level == "bad":
+                    system_level = "bad"
+                elif winrate_level == "warn" or ingest_level == "warn" or bots_level == "warn":
+                    system_level = "warn"
+                else:
+                    system_level = "ok"
+
+                cc["kill"] = {
+                    "daily_pnl": float(daily_pnl),
+                    "daily_limit": float(limits["daily_loss"]),
+                    "daily_level": daily_level,
+                    "worst_open": float(worst_open),
+                    "worst_open_limit": float(limits["worst_open"]),
+                    "worst_open_level": worst_open_level,
+                    "loss_streak": streak,
+                    "loss_streak_limit": int(limits["max_streak"]),
+                    "loss_streak_level": loss_streak_level,
+                    "trades_24h": trades_24h,
+                    "min_trades_24h": int(limits["min_trades_24h"]),
+                    "winrate_24h": winrate_24h,
+                    "winrate_floor": float(limits["winrate_floor"]),
+                    "winrate_level": winrate_level,
+                    "system_level": system_level,
+                }
+
+                # Pulse (use strategy_metrics_daily if available; fallback to mr_positions rollups)
+                # strategy_metrics_daily has paper boolean - perfect for live vs paper
+                pulse_today = float(daily_pnl)
+                pulse_24h = None
+                pulse_7d = None
+                pulse_wr_24h = winrate_24h
+
+                if mode in ("live", "paper"):
+                    paper_flag = (mode == "paper")
+                    # last 7 days from strategy_metrics_daily
+                    rows = _safe_fetchall(
+                        cur,
+                        """
+                        SELECT date, trades, pnl, winrate
+                        FROM strategy_metrics_daily
+                        WHERE strategy = %s
+                          AND paper = %s
+                          AND date >= (CURRENT_DATE - INTERVAL '7 days')
+                        ORDER BY date DESC;
+                        """,
+                        (strategy, paper_flag),
+                    )
+                    if rows:
+                        pnl_7d = Decimal("0")
+                        pnl_24 = Decimal("0")
+                        # approximate 24h by "today" + "yesterday" (daily granularity)
+                        for r0 in rows:
+                            d = r0.get("date")
+                            pnl = to_dec(r0.get("pnl")) or Decimal("0")
+                            pnl_7d += pnl
+                            if d == now_dt.date() or d == (now_dt.date()):
+                                pnl_24 += pnl
+                        pulse_7d = float(pnl_7d)
+                        pulse_24h = float(pnl_24)
+
+                if pulse_24h is None:
+                    # fallback: use today pnl as 24h proxy
+                    pulse_24h = pulse_today
+                if pulse_7d is None:
+                    pulse_7d = pulse_today
+
+                capital_at_risk = Decimal("0")
+                for op in open_positions:
+                    capital_at_risk += Decimal(str(op.get("cost") or 0))
+
+                cc["pulse"] = {
+                    "today_pnl": pulse_today,
+                    "pnl_24h": pulse_24h,
+                    "pnl_7d": pulse_7d,
+                    "winrate_24h": pulse_wr_24h,
+                    "open_count": len(open_positions),
+                    "capital_at_risk": float(capital_at_risk),
+                }
+
+                # Problems
+                problems = []
+                for op in open_positions:
+                    entry = Decimal(str(op.get("entry_price") or 0))
+                    last = Decimal(str(op.get("last_price") or entry))
+                    age_h = Decimal(str(op.get("hours_open") or 0))
+                    unreal = Decimal(str(op.get("unrealized_pnl") or 0))
+                    px_pct = Decimal(str(op.get("px_change_pct") or 0))
+                    dislo = to_dec(op.get("dislocation")) or Decimal("0")
+
+                    flags = []
+                    if age_h >= DASH_PROBLEM_AGE_HOURS:
+                        flags.append("OLD")
+                    if unreal <= DASH_PROBLEM_UNREAL_USD or px_pct <= DASH_PROBLEM_UNREAL_PCT:
+                        flags.append("UNDERWATER")
+                    if not flags:
+                        continue
+
+                    problems.append({
+                        "age_h": float(age_h),
+                        "market_name": op.get("market_name") or op.get("market_id"),
+                        "tags": op.get("market_tags") or "",
+                        "entry_px": float(entry),
+                        "last_px": float(last),
+                        "dislo_pct": float(dislo * 100),
+                        "unreal": float(unreal),
+                        "flag": " + ".join(flags),
+                    })
+                cc["problems"] = sorted(problems, key=lambda x: (x["unreal"], -x["age_h"]))[:10]
+
+                # Market intel only implemented for live (mr_positions schema is known)
+                if mode == "live":
+                    rows = _safe_fetchall(
+                        cur,
+                        """
+                        SELECT
+                          p.market_id,
+                          COALESCE(m.question, p.market_id) AS market_name,
+                          COUNT(*) AS trades,
+                          COALESCE(SUM(p.pnl), 0) AS sum_pnl,
+                          AVG(CASE WHEN p.pnl > 0 THEN 1.0 ELSE 0.0 END) AS winrate,
+                          MAX(p.exit_ts) AS last_exit_ts
+                        FROM mr_positions p
+                        LEFT JOIN markets m ON m.market_id = p.market_id
+                        WHERE (%s = 'all' OR p.strategy = %s)
+                          AND p.status='closed'
+                          AND p.exit_ts IS NOT NULL
+                        GROUP BY p.market_id, market_name
+                        HAVING COUNT(*) >= %s;
+                        """,
+                        (strategy, strategy, DASH_MIN_TRADES_REVIEW),
+                    )
+                    review = []
+                    top = []
+                    for r0 in rows:
+                        trades = int(r0.get("trades") or 0)
+                        sum_pnl = to_dec(r0.get("sum_pnl")) or Decimal("0")
+                        winrate = float(r0.get("winrate") or 0.0)
+                        last_exit_ts = r0.get("last_exit_ts")
+                        last_age = _fmt_age(_age_from_ts(last_exit_ts))
+
+                        item = {
+                            "market_name": r0.get("market_name") or r0.get("market_id"),
+                            "trades": trades,
+                            "sum_pnl": float(sum_pnl),
+                            "winrate": winrate,
+                            "last_age": last_age,
+                        }
+                        if sum_pnl <= DASH_REVIEW_PNL_THRESHOLD or Decimal(str(winrate)) <= DASH_REVIEW_WR_THRESHOLD:
+                            review.append(item)
+                        if sum_pnl >= DASH_TOP_PNL_THRESHOLD:
+                            top.append(item)
+
+                    cc["intel"]["review"] = sorted(review, key=lambda x: x["sum_pnl"])[:5]
+                    cc["intel"]["top"] = sorted(top, key=lambda x: x["sum_pnl"], reverse=True)[:5]
+
+    except Exception as e:
+        health["db"] = {"status": "bad", "text": "FAILED"}
+        health["ingest"] = {"status": "na", "text": "unknown"}
+        health["bots"] = {"status": "na", "text": "na"}
+        page_error = str(e)
+
+    if health["tmux"]["status"] == "bad":
+        health["bots"] = {"status": "bad", "text": "tmux missing sessions"}
+
+    return render_template_string(
+        HTML,
+        db_url_short=db_url_short,
+        now_utc=now_utc,
+        refresh_secs=REFRESH_SECS,
+        view=view,
+        strategy=strategy,
+        strategies=STRATEGIES,
+        mode=mode,
+        modes=MODES,
+        health=health,
+        page_error=page_error,
+        cc=cc,
+        diag=diag,
+    )
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5002, debug=False)

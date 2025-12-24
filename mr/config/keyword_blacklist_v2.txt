@@ -1,0 +1,157 @@
+# =============================================================================
+# Mean Reversion V2 - Keyword Blacklist (Optimized)
+# =============================================================================
+# Based on analysis: Block market types that don't mean-revert well
+#
+# RULE: If keyword appears in market question, skip the market
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# ELECTIONS (50% WR, -$140) - Don't mean-revert, directional
+# -----------------------------------------------------------------------------
+election
+mayor
+president next
+governor
+senator
+win the
+next president
+next mayor
+next governor
+presidential election
+mayoral election
+gubernatorial
+
+# -----------------------------------------------------------------------------
+# CRYPTO PRICE TARGETS (49% WR) - Trend, don't revert
+# -----------------------------------------------------------------------------
+bitcoin reach
+ethereum hit
+btc reach
+eth hit
+hit $
+reach $
+price of bitcoin
+price of btc
+bitcoin be above
+ethereum be above
+solana hit
+solana reach
+xrp hit
+xrp reach
+dip to $
+close above $
+close below $
+close between
+price between
+between $ and
+
+# -----------------------------------------------------------------------------
+# TIME-BASED / RECURRING (trend with news, don't revert)
+# -----------------------------------------------------------------------------
+up or down
+15m
+1h
+15 minute
+1 hour
+minute
+on december
+on january
+on february
+on march
+
+# -----------------------------------------------------------------------------
+# SOCIAL MEDIA METRICS (unpredictable spikes)
+# -----------------------------------------------------------------------------
+tweets from
+posts from
+elon musk post
+tweet count
+post count
+tweet between
+views on day 1
+day 1 views
+youtube video
+mrbeast
+
+# -----------------------------------------------------------------------------
+# BOX OFFICE / ENTERTAINMENT (one-way resolution)
+# -----------------------------------------------------------------------------
+opening weekend
+box office
+first week
+top grossing
+highest grossing
+
+# -----------------------------------------------------------------------------
+# SPORTS (already in tags, but backup)
+# -----------------------------------------------------------------------------
+win on 202
+match on 202
+game on 202
+vs on 202
+vs. on 202
+
+# -----------------------------------------------------------------------------
+# SEARCH / RANKINGS (unpredictable)
+# -----------------------------------------------------------------------------
+top 5 searched
+top 10 searched
+rank in google
+
+# -----------------------------------------------------------------------------
+# WEATHER (doesn't mean-revert)
+# -----------------------------------------------------------------------------
+temperature
+weather
+
+# -----------------------------------------------------------------------------
+# UFO / DECLASSIFIED (one-way news)
+# -----------------------------------------------------------------------------
+ufo
+declassif
+
+# -----------------------------------------------------------------------------
+# MILITARY / GEOPOLITICAL ATTACKS (one-way news events)
+# -----------------------------------------------------------------------------
+strike on
+attack on
+bomb on
+invade on
+
+# -----------------------------------------------------------------------------
+# CRYPTO PRE-MARKET / FDV (bad tags confirmed: 0% in winners)
+# -----------------------------------------------------------------------------
+fdv
+fdv above
+market cap above
+fdv >
+valuation above
+pre-market
+public sale
+committed to the
+
+# -----------------------------------------------------------------------------
+# EARNINGS (directional)
+# -----------------------------------------------------------------------------
+earning
+earnings
+quarterly report
+q1 result
+q2 result
+q3 result
+q4 result
+
+# -----------------------------------------------------------------------------
+# PRICE RANGE MARKETS (bad: "between X and Y" structure)
+# -----------------------------------------------------------------------------
+close between
+settle between
+end between
+finish between
+
+# -----------------------------------------------------------------------------
+# AIRDROPS (directional, don't revert)
+# -----------------------------------------------------------------------------
+airdrop
+token launch

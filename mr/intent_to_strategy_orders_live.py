@@ -162,7 +162,7 @@ def main():
                           intent_id, outcome, metadata
                         )
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-                        ON CONFLICT ON CONSTRAINT uq_strategy_orders_intent_id DO NOTHING
+                        ON CONFLICT (intent_id) DO NOTHING
                         RETURNING id;
                         """,
                         (

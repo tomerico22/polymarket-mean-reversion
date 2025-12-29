@@ -1,0 +1,38 @@
+== Preflight ==
+Sun Dec 28 07:45:23 AM UTC 2025
+host=polymarket-mr1 user=root pwd=/root/polymarket-mean-reversion
+
+== Env file ==
+DB_URL set? yes
+
+== Credentials (presence only) ==
+PRIVATE_KEY: set=True len=64
+FUNDER_ADDRESS: set=True len=42
+POLY_API_KEY: set=True len=36
+POLY_API_SECRET: set=True len=44
+POLY_API_PASSPHRASE: set=True len=64
+
+== Kill duplicates (safety) ==
+root     2014706       1  2 07:45 ?        00:00:00 python mr/intent_to_strategy_orders_live.py
+root     2014710       1  0 07:45 ?        00:00:00 flock -n /tmp/mr_v1.lock /root/polymarket-mean-reversion/.venv/bin/python mr/mean_reversion_executor.py
+root     2014714 2014710  5 07:45 ?        00:00:00 /root/polymarket-mean-reversion/.venv/bin/python mr/mean_reversion_executor.py
+
+== Database sanity ==
+DB connect OK
+
+== Outstanding orders in the pipe (paper=false) ==
+ status | count 
+--------+-------
+(0 rows)
+
+
+== Recent intent summary ==
+ status  | count 
+---------+-------
+ exit    |     1
+ queued  |   466
+ skipped |   115
+(3 rows)
+
+
+== Done ==

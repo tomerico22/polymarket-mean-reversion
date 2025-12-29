@@ -917,14 +917,6 @@ def scan_and_open(cur, markets, now_ts):
             # Keep sizing semantics: BASE_POSITION_USD means "USD per trade"
             size_usd = BASE_POSITION_USD
             size = size_usd / entry_px
-            
-            # Ensure size meets minimum order size (default 5 for most markets)
-            MIN_ORDER_SIZE = Decimal("5.5")
-            if size < MIN_ORDER_SIZE:
-                # Increase size to minimum to ensure we can sell later
-                size = MIN_ORDER_SIZE
-                size_usd = size * entry_px
-                print(f"{LOG_PREFIX} SIZE_ADJUSTED {mid[:16]} increased to min={MIN_ORDER_SIZE} usd={float(size_usd):.2f}")
 
             # 1) Emit intent (optional)
             if MR_INTENTS_ENABLE:
@@ -952,6 +944,17 @@ def scan_and_open(cur, markets, now_ts):
                 continue
 
             # 3) Normal behavior: open mr_positions row
+            # IMPORTANT:
+            # In live mode we rely on the intent -> order -> fills pipeline.
+            # Creating mr_positions here causes ghost positions (DB shows open, but no Polymarket order).
+            ALLOW_DIRECT = (os.getenv("MR_ALLOW_DIRECT_POSITIONS", "0") or "").strip().lower() in (
+                "1", "true", "yes", "y", "on"
+            )
+
+            if MR_INTENTS_ENABLE and not ALLOW_DIRECT:
+                counters["intent_only_skip_pos"] += 1
+                continue
+
             cur.execute("""
                 INSERT INTO mr_positions (strategy, market_id, outcome, side, entry_price, entry_ts, size, avg_price_18h, dislocation)
                 VALUES (%s,%s,%s,'long',%s,%s,%s,%s,%s)

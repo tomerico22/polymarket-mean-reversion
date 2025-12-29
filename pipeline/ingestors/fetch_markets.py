@@ -184,8 +184,25 @@ def normalize_single_market(data: dict) -> dict:
         "event_id": None,
         "question": data.get("question") or data.get("title") or data.get("name"),
         "collateral": data.get("collateral") or "USDC",
-        "yes_token_id": data.get("yesToken") or data.get("yes_token_id") or data.get("yesTokenId"),
-        "no_token_id": data.get("noToken") or data.get("no_token_id") or data.get("noTokenId"),
+        # Token ids: CLOB single-market payload uses tokens:[{token_id,outcome,...},...]
+        "yes_token_id": (lambda d: ( 
+            (d.get("yesToken") or d.get("yes_token_id") or d.get("yesTokenId")) or 
+            ( (lambda toks: ( 
+                ( (lambda names: ( 
+                    (toks[names.index("yes")].get("token_id") or toks[names.index("yes")].get("tokenId") or toks[names.index("yes")].get("id")) if ("yes" in names and "no" in names) else 
+                    (toks[0].get("token_id") or toks[0].get("tokenId") or toks[0].get("id"))
+                ))([str(t.get("outcome") or t.get("name") or "").lower() for t in toks if isinstance(t, dict)]) )
+            ))(d.get("tokens")) if isinstance(d.get("tokens"), list) and len(d.get("tokens")) >= 2 else None )
+        ))(data),
+        "no_token_id": (lambda d: ( 
+            (d.get("noToken") or d.get("no_token_id") or d.get("noTokenId")) or 
+            ( (lambda toks: ( 
+                ( (lambda names: ( 
+                    (toks[names.index("no")].get("token_id") or toks[names.index("no")].get("tokenId") or toks[names.index("no")].get("id")) if ("yes" in names and "no" in names) else 
+                    (toks[1].get("token_id") or toks[1].get("tokenId") or toks[1].get("id"))
+                ))([str(t.get("outcome") or t.get("name") or "").lower() for t in toks if isinstance(t, dict)]) )
+            ))(d.get("tokens")) if isinstance(d.get("tokens"), list) and len(d.get("tokens")) >= 2 else None )
+        ))(data),
         "created_ts": data.get("createdAt") or data.get("created_at") or data.get("created"),
         "resolve_ts": data.get("resolvedAt") or data.get("resolved_at"),
         "resolution": data.get("resolution"),
@@ -200,10 +217,14 @@ def ensure_market_exists(market_id: str, timeout: int = 5) -> bool:
     Returns True if market exists/was added, False on failure.
     """
     with connect(DB_URL, row_factory=dict_row) as conn, conn.cursor() as cur:
-        cur.execute("SELECT question FROM markets WHERE market_id = %s", (market_id,))
+        cur.execute("SELECT question, yes_token_id, no_token_id FROM markets WHERE market_id = %s", (market_id,))
         row = cur.fetchone()
-        if row and row[0]:
-            return True
+        if row:
+            q  = row.get("question") if isinstance(row, dict) else row[0]
+            yt = row.get("yes_token_id") if isinstance(row, dict) else row[1]
+            nt = row.get("no_token_id")  if isinstance(row, dict) else row[2]
+            if q and yt and nt:
+                return True
 
         try:
             data = fetch_single_market(market_id, timeout=timeout)

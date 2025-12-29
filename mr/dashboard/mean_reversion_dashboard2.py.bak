@@ -314,105 +314,6 @@ HTML = r"""
 
     .kpirow { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
     .kpi { padding: 6px 10px; border: 1px solid rgba(42,49,66,0.85); background: rgba(0,0,0,0.12); border-radius: 999px; font-size: 0.78rem; color: var(--muted); }
-  
-    /* Mobile responsive styles */
-    @media (max-width: 768px) {
-      .topbar {
-        position: relative !important;
-        padding: 8px;
-      }
-      .topbar h1 {
-        font-size: 1.2rem;
-        margin: 0;
-      }
-      .topbar .small {
-        font-size: 0.7rem;
-        line-height: 1.2;
-      }
-      .tabs {
-        margin-top: 8px;
-      }
-      .tab {
-        padding: 6px 12px;
-        font-size: 0.85rem;
-      }
-      .toolbar {
-        flex-wrap: wrap;
-        gap: 8px;
-        padding: 8px 0;
-      }
-      .toolbar select, .toolbar input {
-        font-size: 0.85rem;
-        padding: 4px 8px;
-      }
-      .toolbar label {
-        font-size: 0.75rem;
-      }
-      .healthbar {
-        flex-wrap: wrap;
-        gap: 4px;
-        padding: 8px 0;
-      }
-      .pill {
-        padding: 4px 8px;
-        font-size: 0.7rem;
-      }
-      .pill .label {
-        display: none;
-      }
-      .pill .value {
-        font-size: 0.7rem;
-      }
-      .grid {
-        grid-template-columns: repeat(2, 1fr);
-        gap: 8px;
-        padding: 8px;
-      }
-      .card {
-        padding: 8px;
-      }
-      .card-label {
-        font-size: 0.7rem;
-      }
-      .card-value {
-        font-size: 1.1rem;
-      }
-      body {
-        padding-top: 0 !important;
-      }
-      .section {
-        margin: 8px;
-        padding: 8px;
-      }
-      table {
-        font-size: 0.75rem;
-      }
-      th, td {
-        padding: 4px 6px !important;
-      }
-      .content {
-        overflow-x: auto;
-      }
-    }
-    
-    /* Very small screens */
-    @media (max-width: 480px) {
-      .topbar .row {
-        flex-direction: column;
-        align-items: flex-start;
-      }
-      .tabs {
-        width: 100%;
-        justify-content: center;
-      }
-      .grid {
-        grid-template-columns: repeat(2, 1fr);
-      }
-      .healthbar .pill .label {
-        display: none;
-      }
-    }
-
   </style>
   <script>
     const refreshSecs = {{ refresh_secs }};
@@ -885,6 +786,7 @@ HTML = r"""
             <tr>
               <th class="nowrap">Entry TS</th>
               <th>Market</th>
+              <th>Tags</th>
               <th class="nowrap">Outcome</th>
               <th class="right">Dislo%</th>
               <th class="right">Size</th>
@@ -900,7 +802,12 @@ HTML = r"""
             {% for p in diag.open_positions %}
             <tr>
               <td class="nowrap small">{{ p.entry_ts }}</td>
-              <td class="small" title="{{ p.market_id }}">{{ (p.market_name or p.market_id)[:50] }}</td>
+              <td class="small">
+                {{ p.market_id[:16] }}…
+                <button class="copy" data-copy="{{ p.market_id }}">copy</button>
+              </td>
+              <td class="small">{{ p.market_name or '' }}</td>
+              <td class="small">{{ p.market_tags or '' }}</td>
               <td class="nowrap">{{ p.outcome_label }}</td>
               <td class="right">{{ "%.1f"|format(p.dislocation * 100 if p.dislocation is not none else 0) }}</td>
               <td class="right">{{ "%.2f"|format(p.size or 0) }}</td>
@@ -1442,23 +1349,12 @@ def _load_open_positions(cur, strategy, mode):
         ORDER BY p.entry_ts DESC;
     """
     rows = _safe_fetchall(cur, sql, (strategy, strategy))
-    
-    # Fetch live prices from Polymarket API
-    live_prices = _fetch_polymarket_positions()
 
     out = []
     for p in rows:
-        market_id = p.get("market_id") or ""
-        live_data = live_prices.get(market_id)
-        
-        if live_data and live_data.get("cur_price"):
-            entry = Decimal(str(live_data.get("avg_price", 0)))
-            last = Decimal(str(live_data["cur_price"]))
-            size = Decimal(str(live_data.get("size", 0)))
-        else:
-            entry = to_dec(p.get("entry_price")) or Decimal("0")
-            last = to_dec(p.get("last_price")) or entry
-            size = to_dec(p.get("size") or 0) or Decimal("0")
+        entry = to_dec(p.get("entry_price")) or Decimal("0")
+        last = to_dec(p.get("last_price")) or entry
+        size = to_dec(p.get("size") or 0) or Decimal("0")
 
         cost = entry * size
         unreal = (last - entry) * size
@@ -1476,7 +1372,7 @@ def _load_open_positions(cur, strategy, mode):
         out.append(
             {
                 "entry_ts": p.get("entry_ts"),
-                "market_id": market_id,
+                "market_id": p.get("market_id") or "",
                 "market_name": p.get("market_name") or p.get("market_id") or "",
                 "market_tags": tags_txt,
                 "outcome_label": _outcome_label(p.get("outcome")),
@@ -2156,33 +2052,8 @@ def index():
 
     cc = {
         "status": {},
-        "kill": {
-            "daily_pnl": 0.0,
-            "daily_limit": -200.0,
-            "daily_level": "ok",
-            "worst_open": 0.0,
-            "worst_open_limit": -50.0,
-            "worst_open_level": "ok",
-            "loss_streak": 0,
-            "loss_streak_limit": 5,
-            "loss_streak_level": "ok",
-            "trades_24h": 0,
-            "min_trades_24h": 10,
-            "winrate_24h": None,
-            "winrate_floor": 0.45,
-            "winrate_level": "na",
-            "system_level": "ok",
-        },
-        "perf": {
-            "pnls": {"ptoday": 0.0, "pyday": 0.0, "p7": 0.0, "pall": 0.0},
-            "trades": {"ttoday": 0, "tyday": 0, "t7": 0, "tall": 0},
-            "winrate": {"wtoday": None, "wyday": None, "w7": None, "wall": None},
-            "avgpnl": {"atoday": None, "ayday": None, "a7": None, "aall": None},
-            "slrate": {"stoday": None, "syday": None, "s7": None, "sall": None},
-            "largestloss": {"ltoday": None, "lyday": None, "l7": None, "lall": None},
-            "sharpe": {"shtoday": None, "shyday": None, "sh7": None, "shall": None},
-            "status": {"pnl_class": "muted", "pnl_text": "-", "wr_class": "muted", "wr_text": "-", "sl_class": "muted", "sl_text": "-", "sh_class": "muted", "sh_text": "-"},
-        },
+        "kill": {},
+        "perf": {},
         "filters": {"markets_scanned": 0, "after_filters": 0, "scan_entries": 0, "trades_executed_today": 0, "blocked": {}},
         "problems": [],
         "intel": {"review": [], "top": []},
